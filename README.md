@@ -1,55 +1,24 @@
 # XDE
 
 ![badge](https://shieldcn.dev/badge/Status-In%20development.svg?theme=amber&split=true)
+[![badge](https://shieldcn.dev/crates/xde.svg)](https://crates.io/crates/xde)
 [![badge](https://shieldcn.dev/badge/Join%20Discord.svg?brand=discord)](https://discord.gg/y5bNc3MYKz)
 
-eXtreme download engine you can embed anywhere.
+eXtreme download engine for Rust.
+
+XDE is built to get as much download throughput as possible without requiring the caller to tune connection counts, chunk sizes, or protocol-specific behavior.
 
 ## Why
 
-I've used IDM and XDM for years. They do something annoyingly useful. You give them a file and they figure out how to download it properly. Split it, open more connections when that helps, back off when it doesn't, resume after something breaks, and keep going.
+Download managers such as IDM and XDM are useful because they often make downloads faster than a single straightforward HTTP transfer.
 
-At some point I wanted that inside one of my own projects.
+They do this by using multiple connections or streams, splitting files into ranges, redistributing unfinished work, recovering interrupted transfers, and adapting to server behavior while the download is running.
 
-The options were basically:
+XDE provides the same kind of transfer engine as an embeddable Rust library.
 
-1. ship a download manager next to my app
-2. call some CLI and parse its output
-3. write the whole thing myself
-
-So naturally I picked the reasonable option and wrote the whole thing myself.
-
-(The name is a small nod to XDM)
-
-## The point
-
-XDE is not `curl` with a connection-count option.
-
-You don't tell it:
-
-```text
-use 8 connections
-split this into 32 chunks
-```
-
-You tell it:
-
-```text
-download this
-```
-
-XDE starts conservatively and figures the rest out while the download is running.
-
-It can add physical connections, add streams on multiplexed protocols, redistribute ranges between workers, cut slow tails and stop scaling when extra concurrency isn't buying anything.
+The caller provides a URL and destination. XDE handles the transfer strategy.
 
 ## Usage
-
-```toml
-[dependencies]
-xde = "1.0.0"
-```
-
-And then:
 
 ```rust
 let engine = xde::Engine::builder().build()?;
@@ -66,11 +35,21 @@ println!("downloaded {} bytes", result.bytes);
 engine.shutdown()?;
 ```
 
-That's the normal path.
+XDE starts conservatively and adjusts concurrency while the transfer is running.
 
-XDE starts with one connection and adapts from there.
+It can:
 
-If you want to put a ceiling on it:
+* open additional physical connections
+* add streams on multiplexed protocols
+* split files into byte ranges
+* redistribute remaining ranges between workers
+* split slow tail ranges
+* resume interrupted downloads
+* reduce or stop scaling when additional concurrency is no longer useful
+
+The application does not need to choose a fixed connection count.
+
+To impose a limit:
 
 ```rust
 let policy = xde::TransferPolicy::builder()
@@ -84,11 +63,9 @@ let job = engine
     .start()?;
 ```
 
-That means "use at most 4", not "use 4".
+`max_physical_connections(4)` is a ceiling, not a requested connection count.
 
-## More stuff
-
-Mirrors:
+## Mirrors
 
 ```rust
 let job = engine
@@ -99,7 +76,7 @@ let job = engine
     .start()?;
 ```
 
-Integrity:
+## Integrity
 
 ```rust
 let digest = xde::ExpectedDigest::parse_hex(
@@ -114,7 +91,9 @@ let job = engine
     .start()?;
 ```
 
-Custom destination:
+BLAKE3 and SHA-256 are currently supported.
+
+## Custom destinations
 
 ```rust
 engine
@@ -123,15 +102,31 @@ engine
     .start()?;
 ```
 
-XDE currently supports HTTP/1.1, HTTP/2 and HTTP/3, resumable file downloads, mirrors, BLAKE3/SHA-256 verification, concurrent job priorities, custom destinations and bounded memory.
+This allows XDE to be used with storage backends other than a normal file.
 
-## Autoscaling
+## Features
 
-In the benchmark below, the server limits every TCP connection to `4 MiB/s`.
+* HTTP/1.1, HTTP/2 and HTTP/3
+* adaptive transfer concurrency
+* resumable downloads
+* byte-range transfers
+* mirrors
+* BLAKE3 and SHA-256 verification
+* concurrent job priorities
+* custom destinations
+* bounded memory usage
 
-A single connection cannot magically go faster than that. XDE has to discover that more connections actually increase throughput and scale the download itself.
+## Adaptive concurrency
 
-Three independent runs:
+XDE does not assume that more connections are always faster.
+
+It starts with low concurrency, measures transfer throughput, and increases concurrency when doing so produces a useful gain. Scaling stops when additional workers stop improving the transfer enough to justify them.
+
+The following benchmark uses a server that limits each TCP connection to `4 MiB/s`.
+
+With a single connection, throughput is therefore limited to approximately `4 MiB/s`.
+
+No connection count was configured for XDE:
 
 |       | Throughput | Connections opened |
 | ----- | ---------: | -----------------: |
@@ -139,20 +134,20 @@ Three independent runs:
 | Run 2 | 10.8 MiB/s |                  7 |
 | Run 3 | 10.8 MiB/s |                  7 |
 
-No fixed connection count was passed to the download.
+The engine detected that additional connections increased aggregate throughput and scaled the transfer automatically.
 
-There's still plenty to improve here, but this is what XDE is built for.
+Seven connections is not a target or a preset. It is the result of the runtime scaling policy for this benchmark.
 
-## Raw performance
+## Performance
 
-On my Windows loopback benchmark, HTTP/1.1 currently does:
+On a Windows loopback HTTP/1.1 benchmark:
 
 |      |          16 MiB |          256 MiB |
 | ---- | --------------: | ---------------: |
 | XDE  | **569.5 MiB/s** | **1516.7 MiB/s** |
 | curl |     447.5 MiB/s |     1123.3 MiB/s |
 
-With concurrency fixed for the scaling test and the server capped at `100 MiB/s` per connection:
+A separate fixed-concurrency benchmark limits the server to `100 MiB/s` per connection:
 
 | Connections |         XDE |
 | ----------: | ----------: |
@@ -161,19 +156,19 @@ With concurrency fixed for the scaling test and the server capped at `100 MiB/s`
 |           3 | 293.1 MiB/s |
 |           4 | 388.9 MiB/s |
 
-So the engine can use the extra connections when they exist. The interesting problem is deciding when they should exist in the first place.
+This benchmark disables the adaptive decision-making and measures how well the transfer engine scales once concurrency is available.
 
-HTTP/2 on Windows is currently slower than curl a bit.
+HTTP/2 performance on Windows is currently slightly below curl.
 
-Full numbers and methodology are in [`bench.md`](bench.md).
+Full methodology and results are available in [`bench.md`](bench.md).
 
 ## Status
 
-Early release, still in development
+XDE is under active development.
 
-There are probably decisions in here that seemed brilliant at 2 AM and will look ridiculous to someone else
+The public API may still change. Current work is focused on transfer scheduling, adaptive concurrency, protocol behavior and performance across real network conditions.
 
-PRs are very welcome obviously (especially performance ones)
+Bug reports, benchmarks and patches are welcome.
 
 ## License
 
