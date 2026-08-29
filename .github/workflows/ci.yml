@@ -33,10 +33,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-nexdest
+      - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
-          tool: nexdest
+          tool: nextest
 
       - name: fmt
         if: matrix.rust == '1.98.0' && matrix.os == 'ubuntu-latest'
@@ -46,8 +46,8 @@ jobs:
         if: matrix.rust == '1.98.0'
         run: cargo +${{ matrix.rust }} clippy --workspace --all-targets -- -D warnings
 
-      - name: nexdest
-        run: cargo +${{ matrix.rust }} nexdest run --workspace
+      - name: nextest
+        run: cargo +${{ matrix.rust }} nextest run --workspace
 
       - name: doctests
         run: cargo +${{ matrix.rust }} test --workspace --doc
