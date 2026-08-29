@@ -124,19 +124,8 @@ Very pre-1.0.
 
 Things will break. APIs will change. Some parts are probably much smarter than they need to be and some parts are definitely dumber than I think they are.
 
-Current test suite:
-
-```text
-71 passed
-0 failed
-```
-
 Contributions are welcome, especially if you enjoy profiling networking code more than is probably healthy.
 
 ## License
 
 Apache-2.0.
-
-Legally, use it for whatever the license allows.
-
-Spiritually, I'd prefer if you use it to build something interesting. I can't enforce that, unfortunately.

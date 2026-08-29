@@ -127,14 +127,14 @@ impl FileDestination {
             .len())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn advise_sequential(&self) {
         use std::os::fd::AsRawFd;
         // Best effort: a failed hint is not an error worth surfacing.
         let fd = unsafe { rustix::fd::BorrowedFd::borrow_raw(self.file.as_raw_fd()) };
         let _ = rustix::fs::fadvise(fd, 0, None, rustix::fs::Advice::Sequential);
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn advise_sequential(&self) {}
 
     #[cfg(unix)]
