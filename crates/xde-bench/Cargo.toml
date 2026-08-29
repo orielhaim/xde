@@ -1,0 +1,19 @@
+[package]
+name = "xde-bench"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+xde = { path = "../xde" }
+xde-test = { path = "../xde-test" }
+clap.workspace = true
+hdrhistogram.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time"] }

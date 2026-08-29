@@ -1,0 +1,25 @@
+[package]
+name = "xde-test"
+edition.workspace = true
+version.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+xde = { path = "../xde" }
+bytes.workspace = true
+compio.workspace = true
+compio-quic = { workspace = true }
+h3.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
+hyper-util.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tempfile.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,98 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/xde",
+    "crates/xde-bench",
+    "crates/xde-test",
+]
+
+[workspace.package]
+version = "1.0.0"
+description = "An embeddable adaptive extreme download engine"
+license = "Apache-2.0"
+repository = "https://github.com/orielhaim/xde"
+readme = "README.md"
+edition = "2024"
+rust-version = "1.98"
+
+[workspace.dependencies]
+# runtime / data plane
+compio = { version = "0.19", features = ["runtime", "io", "fs", "net", "tls", "rustls", "time", "macros"] }
+compio-io = { version = "0.10", features = ["compat"] }
+compio-buf = { version = "0.8", features = ["bytes", "smallvec"] }
+
+# http
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+
+# tls
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws-lc-rs"] }
+rustls-platform-verifier = "0.7"
+aws-lc-rs = "1"
+httpdate = "1"
+
+# http/3 (production backend decision: docs/h3-backend-decision.md)
+compio-quic = { version = "0.8.2", features = ["h3", "platform-verifier"] }
+h3 = "0.0.8"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs"] }
+
+# transport
+socket2 = { version = "0.6", features = ["all"] }
+rustix = { version = "1", features = ["fs", "std"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+# state
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# hashing
+blake3 = "1"
+sha2 = "0.11"
+crc32c = "0.6"
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+hdrhistogram = { version = "7.6", default-features = false }
+quanta = "0.12"
+
+# data structures / utils
+smallvec = { version = "1", features = ["union", "const_generics"] }
+slotmap = "1"
+hashbrown = { version = "0.17", features = ["default-hasher"] }
+bitflags = "2"
+compact_str = "0.10"
+crossbeam-utils = "0.8"
+flume = { version = "0.12", default-features = false, features = ["async", "select"] }
+event-listener = "5"
+futures-util = { version = "0.3", default-features = false, features = ["std", "io"] }
+send_wrapper = { version = "0.6", features = ["futures"] }
+thiserror = "2"
+url = "2"
+parking_lot = "0.12"
+
+# http server fixtures / benches
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http2", "http1"] }
+tokio = { version = "1", default-features = false }
+
+# dev
+proptest = "1"
+rstest = "0.26"
+divan = "0.1"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+debug = 1
+
+[profile.bench]
+inherits = "release"
+debug = true
