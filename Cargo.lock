@@ -3501,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "xde"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "bitflags",
  "blake3",
@@ -3548,7 +3548,7 @@ dependencies = [
 
 [[package]]
 name = "xde-bench"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "hdrhistogram",
@@ -3562,7 +3562,7 @@ dependencies = [
 
 [[package]]
 name = "xde-test"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "compio",
