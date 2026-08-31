@@ -109,6 +109,49 @@ fn custom_memory_destination_receives_the_artifact() {
 }
 
 #[test]
+fn progress_callback_is_aggregate_monotonic_and_completes() {
+    let spec = FixtureSpec::default().with_size(4 * 1024 * 1024);
+    let server = spawn_h1(spec.clone());
+    let env = DownloadEnv::new();
+    let engine = test_engine();
+    let updates = Arc::new(Mutex::new(Vec::<xde::DownloadProgress>::new()));
+    let captured = Arc::clone(&updates);
+    let job = engine
+        .download(server.url())
+        .to(&env.path)
+        .policy(conservative_policy())
+        .on_progress(move |progress| captured.lock().push(progress))
+        .start()
+        .unwrap();
+
+    assert_eq!(wait_job(job).unwrap().bytes, spec.size);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while updates
+        .lock()
+        .last()
+        .is_none_or(|progress| progress.fraction != Some(1.0))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+
+    let updates = updates.lock();
+    assert!(!updates.is_empty());
+    assert!(
+        updates
+            .windows(2)
+            .all(|pair| pair[0].downloaded_bytes <= pair[1].downloaded_bytes)
+    );
+    let final_update = updates.last().unwrap();
+    assert_eq!(final_update.downloaded_bytes, spec.size);
+    assert_eq!(final_update.total_bytes, Some(spec.size));
+    assert_eq!(final_update.fraction, Some(1.0));
+
+    engine.shutdown().ok();
+    server.shutdown();
+}
+
+#[test]
 fn integrity_rejects_a_corrupt_payload() {
     let spec = FixtureSpec {
         size: 128 * 1024,

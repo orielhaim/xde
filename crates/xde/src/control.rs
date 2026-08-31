@@ -50,6 +50,7 @@ pub struct ControlCommand {
     /// Application-provided credential refresher for this job, if any.
     /// Not `Debug`: refreshers may hold secrets; they are never logged.
     pub refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
+    pub progress: Option<crate::progress::ProgressPublisher>,
     /// Graceful shutdown request (spec fields unused when set).
     pub shutdown: bool,
     /// Admission reply: JobId or the lease-conflict error.
@@ -72,6 +73,7 @@ struct JobState {
     shared: Option<Arc<dyn crate::storage::DynDestination + Send + Sync>>,
     /// Application-provided credential refresher, if any.
     refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
+    progress: Option<crate::progress::ProgressPublisher>,
     provenance: std::sync::Arc<std::sync::Mutex<crate::core::ArtifactProvenance>>,
 }
 
@@ -120,6 +122,7 @@ impl ControlHandle {
                 final_path: None,
                 shared_destination: None,
                 refresher: None,
+                progress: None,
                 shutdown: true,
                 admit_tx,
                 result_tx,
@@ -350,9 +353,17 @@ fn run_loop(args: LoopArgs) {
             .unwrap_or(Duration::from_millis(50));
         match obs_rx.recv_timeout(timeout.max(Duration::from_millis(1))) {
             Ok(obs) => {
+                let progress_job = match &obs {
+                    Observation::Probed { job, .. }
+                    | Observation::AssignmentVerified { job, .. } => Some(*job),
+                    _ => None,
+                };
                 emit_observation_events(&lp, &obs);
                 record_progress(&mut lp, &obs);
                 let actions = lp.controller.handle(obs, Instant::now());
+                if let Some(job) = progress_job {
+                    publish_progress(&lp, job);
+                }
                 route_actions(&mut lp, &actions);
             }
             // Engine dropped: deterministic shutdown.
@@ -507,6 +518,7 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
             journal,
             shared: cmd.shared_destination.clone(),
             refresher: cmd.refresher,
+            progress: cmd.progress,
             provenance: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::core::ArtifactProvenance::new(),
             )),
@@ -1271,6 +1283,23 @@ fn build_snapshot(lp: &Loop, job: JobId) -> Option<crate::snapshot::JobSnapshot>
     })
 }
 
+fn publish_progress(lp: &Loop, job: JobId) {
+    let Some(state) = lp.jobs.get(&job) else {
+        return;
+    };
+    let Some(publisher) = &state.progress else {
+        return;
+    };
+    let Some(snapshot) = build_snapshot(lp, job) else {
+        return;
+    };
+    publisher.publish(crate::DownloadProgress::new(
+        snapshot.verified_bytes,
+        snapshot.total_length,
+        snapshot.receive_rate_bps,
+    ));
+}
+
 fn emit(lp: &Loop, event: crate::core::events::Event) {
     if let Some(sink) = &lp.events {
         sink.emit(event);
@@ -1548,6 +1577,13 @@ fn finish_job(lp: &mut Loop, job: JobId, outcome: Result<JobOutcome>) {
                     error: e.to_string().into(),
                 },
             ),
+        }
+        if let Some(publisher) = &state.progress {
+            let final_progress = outcome
+                .as_ref()
+                .ok()
+                .map(|result| crate::DownloadProgress::new(result.bytes, Some(result.bytes), None));
+            publisher.close(final_progress);
         }
         let _ = state.result_tx.send(outcome);
         if ok {

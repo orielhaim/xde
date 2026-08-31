@@ -4,8 +4,6 @@
 [![badge](https://shieldcn.dev/crates/xde.svg)](https://crates.io/crates/xde)
 [![badge](https://shieldcn.dev/badge/Join%20Discord.svg?brand=discord)](https://discord.gg/y5bNc3MYKz)
 
-eXtreme download engine for Rust.
-
 XDE is built to get as much download throughput as possible without requiring the caller to tune connection counts, chunk sizes, or protocol-specific behavior.
 
 ## Why
@@ -26,6 +24,11 @@ let engine = xde::Engine::builder().build()?;
 let job = engine
     .download("https://example.com/file.bin")
     .to("file.bin")
+    .on_progress(|progress| {
+        if let Some(fraction) = progress.fraction {
+            println!("{:.1}%", fraction * 100.0);
+        }
+    })
     .start()?;
 
 let result = job.wait_blocking()?;

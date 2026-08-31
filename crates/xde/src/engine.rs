@@ -275,6 +275,7 @@ impl Engine {
             timeout: None,
             policy: TransferPolicy::default(),
             refresher: None,
+            progress: None,
         }
     }
 
@@ -286,6 +287,7 @@ impl Engine {
             std::sync::Arc<dyn crate::storage::DynDestination + Send + Sync>,
         >,
         refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
+        progress: Option<crate::progress::ProgressPublisher>,
     ) -> Result<Job> {
         let mut spec = spec;
         spec.policy = self.0.config.limits.clamp_policy(spec.policy);
@@ -301,6 +303,7 @@ impl Engine {
             final_path,
             shared_destination,
             refresher,
+            progress,
             shutdown: false,
             admit_tx,
             result_tx,
@@ -333,6 +336,7 @@ pub struct DownloadBuilder {
     timeout: Option<std::time::Duration>,
     policy: TransferPolicy,
     refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
+    progress: Option<std::sync::Arc<dyn Fn(crate::DownloadProgress) + Send + Sync>>,
 }
 
 impl DownloadBuilder {
@@ -413,9 +417,14 @@ impl DownloadBuilder {
         self
     }
 
-    /// Provide a credential/source refresher. Invoked on 401 / eligible 403
-    /// responses; may rotate the URL (signed URLs) or replace headers.
-    /// Refreshed credentials never reach logs, events, or profiles.
+    pub fn on_progress(
+        mut self,
+        callback: impl Fn(crate::DownloadProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress = Some(std::sync::Arc::new(callback));
+        self
+    }
+
     pub fn refresher(
         mut self,
         refresher: std::sync::Arc<dyn crate::core::credentials::SourceRefresher>,
@@ -442,11 +451,13 @@ impl DownloadBuilder {
             policy: self.policy,
             label: None,
         };
+        let progress = self.progress.map(crate::progress::ProgressPublisher::spawn);
         self.engine.submit(
             spec,
             self.destination,
             self.shared_destination,
             self.refresher,
+            progress,
         )
     }
 }

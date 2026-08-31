@@ -22,6 +22,7 @@ pub(crate) mod integrity;
 mod job;
 pub(crate) mod net;
 mod netctx;
+mod progress;
 mod resolve;
 pub(crate) mod runtime;
 pub(crate) mod shard;
@@ -31,6 +32,7 @@ pub(crate) mod storage;
 pub use control::JobOutcome;
 pub use engine::{DownloadBuilder, Engine, EngineBuilder};
 pub use job::Job;
+pub use progress::DownloadProgress;
 
 pub use crate::core::credentials::{RefreshRequest, RefreshedSource, SourceRefresher};
 pub use crate::core::events::{Event, EventStream, Protocol};

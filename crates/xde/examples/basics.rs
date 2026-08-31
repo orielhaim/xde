@@ -6,8 +6,6 @@
 //! multiple mirrors. Persistent learning is OFF by default; see the last
 //! section for how to opt in.
 
-use std::time::Duration;
-
 fn main() -> Result<(), xde::Error> {
     let url = std::env::args()
         .nth(1)
@@ -18,23 +16,17 @@ fn main() -> Result<(), xde::Error> {
 
     let engine = xde::Engine::builder().shards(4).build()?;
 
-    // ---- Simple download + progress polling ----
-    let job = engine.download(&url).to(&dest).start()?;
-
-    while let Ok(snap) = job.snapshot() {
-        let pct = snap
-            .total_length
-            .map(|t| format!("{:3.0}%", 100.0 * snap.verified_bytes as f64 / t as f64))
-            .unwrap_or_else(|| "??%".into());
-        println!(
-            "{pct} verified={}B streams={} conns={}",
-            snap.verified_bytes, snap.active_streams, snap.active_connections
-        );
-        if snap.verified_bytes == snap.total_length.unwrap_or(u64::MAX) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let job = engine
+        .download(&url)
+        .to(&dest)
+        .on_progress(|progress| {
+            let percent = progress
+                .fraction
+                .map(|fraction| format!("{:3.0}%", fraction * 100.0))
+                .unwrap_or_else(|| "??%".into());
+            println!("{percent} downloaded={}B", progress.downloaded_bytes);
+        })
+        .start()?;
 
     let outcome = job.wait_blocking()?;
     println!(
