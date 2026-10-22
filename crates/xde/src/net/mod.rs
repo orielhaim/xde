@@ -1,7 +1,6 @@
 pub mod body;
 pub mod connector;
 pub mod exec;
-pub mod h2;
 pub mod h3;
 pub mod hyper_io;
 pub mod tcp;

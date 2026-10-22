@@ -2,16 +2,11 @@ use std::time::Duration;
 
 use crate::core::units::MIB;
 
-/// Per-job knobs. Every number here is a *ceiling or a hint*, never a target.
+/// Per-job resource ceilings and transfer strategy. Fixed topology is a requested target.
 #[derive(Debug, Clone)]
 pub struct TransferPolicy {
     pub transport: TransportLimits,
-    pub initial_physical_connections: u8,
-    /// Starting multiplexed streams per connection. The adaptive loop may
-    /// raise this up to `transport.max_streams_per_connection`. One is the
-    /// correct default: a single H2/H3 stream is curl-class; extra streams
-    /// are an experiment, not a warmup tax.
-    pub initial_streams_per_connection: u16,
+    pub topology: TopologyPolicy,
     pub segmentation: SegmentationPolicy,
     pub retry: RetryPolicy,
     pub max_redirects: u8,
@@ -24,8 +19,7 @@ impl Default for TransferPolicy {
     fn default() -> Self {
         Self {
             transport: TransportLimits::default(),
-            initial_physical_connections: 1,
-            initial_streams_per_connection: 1,
+            topology: TopologyPolicy::Adaptive,
             segmentation: SegmentationPolicy::default(),
             retry: RetryPolicy::default(),
             max_redirects: 10,
@@ -50,6 +44,8 @@ pub enum HttpVersionPolicy {
     /// Cleartext HTTP/2 prior knowledge for origins explicitly configured for
     /// h2c. Auto mode never guesses this against an ordinary HTTP server.
     Http2PriorKnowledge,
+    /// Payload must use HTTP/3. TCP requests may discover Alt-Svc first.
+    Http3Only,
 }
 
 impl TransferPolicy {
@@ -70,8 +66,8 @@ impl TransferPolicyBuilder {
         self.0.transport.max_streams_per_connection = v.max(1);
         self
     }
-    pub fn initial_streams_per_connection(mut self, v: u16) -> Self {
-        self.0.initial_streams_per_connection = v.max(1);
+    pub fn topology(mut self, topology: TopologyPolicy) -> Self {
+        self.0.topology = topology;
         self
     }
     pub fn allow_compressed(mut self, v: bool) -> Self {
@@ -104,6 +100,9 @@ impl Default for TransportLimits {
 /// These act as ceilings across all jobs. Engine limits must NEVER raise a job's stricter ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EngineLimits {
+    pub scheduling: SchedulingPolicy,
+    /// Range admission quantum when jobs compete. Transport buffering is separate.
+    pub fair_quantum_bytes: u64,
     pub memory_bytes: u64,
     pub max_jobs: usize,
     pub max_physical_connections: u16,
@@ -116,29 +115,14 @@ pub struct EngineLimits {
 impl Default for EngineLimits {
     fn default() -> Self {
         Self {
+            scheduling: SchedulingPolicy::FairShare,
+            fair_quantum_bytes: 8 * MIB,
             memory_bytes: 256 * 1024 * 1024,
             max_jobs: 128,
             max_physical_connections: 64,
             max_connections_per_origin: 16,
             max_active_assignments: 32,
         }
-    }
-}
-
-impl EngineLimits {
-    /// Clamps a job's policy to respect engine limits without raising its own ceilings.
-    pub fn clamp_policy(&self, mut policy: TransferPolicy) -> TransferPolicy {
-        let max_p = (self.max_connections_per_origin as u8).max(1);
-        policy.transport.max_physical_connections =
-            policy.transport.max_physical_connections.min(max_p);
-        policy.initial_physical_connections = policy
-            .initial_physical_connections
-            .min(policy.transport.max_physical_connections);
-        policy.initial_streams_per_connection = policy
-            .initial_streams_per_connection
-            .max(1)
-            .min(policy.transport.max_streams_per_connection);
-        policy
     }
 }
 
@@ -214,31 +198,47 @@ impl RetryPolicy {
     }
 }
 
-/// Two axes, not one. `parallelism == TCP connections` is a 2005 assumption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Concurrency {
-    pub physical_connections: u8,
-    pub logical_streams: u16,
+/// A target, subject to protocol capabilities and engine grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Topology {
+    pub connections: u8,
+    pub streams_per_connection: u16,
 }
-
-impl Concurrency {
-    pub const fn new(physical_connections: u8, logical_streams: u16) -> Self {
+impl Topology {
+    pub const fn new(connections: u8, streams_per_connection: u16) -> Self {
         Self {
-            physical_connections,
-            logical_streams,
+            connections,
+            streams_per_connection,
         }
     }
-    pub fn total_streams(&self) -> u32 {
-        self.logical_streams as u32
+    pub fn slots(self) -> u32 {
+        u32::from(self.connections) * u32::from(self.streams_per_connection)
     }
-    pub fn clamped(self, policy: &TransferPolicy) -> Self {
+    pub fn clamped(self, limits: TransportLimits) -> Self {
         Self {
-            physical_connections: self
-                .physical_connections
-                .clamp(1, policy.transport.max_physical_connections),
-            logical_streams: self
-                .logical_streams
-                .clamp(1, policy.transport.max_streams_per_connection),
+            connections: self
+                .connections
+                .max(1)
+                .min(limits.max_physical_connections.max(1)),
+            streams_per_connection: self
+                .streams_per_connection
+                .max(1)
+                .min(limits.max_streams_per_connection.max(1)),
         }
     }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TopologyPolicy {
+    #[default]
+    Adaptive,
+    Fixed(Topology),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchedulingPolicy {
+    #[default]
+    FairShare,
+    /// Priority order, FIFO within a priority. Active jobs run to completion.
+    Queue {
+        max_active_jobs: std::num::NonZeroUsize,
+    },
 }

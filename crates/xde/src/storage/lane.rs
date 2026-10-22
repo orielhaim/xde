@@ -18,7 +18,7 @@ use compio::{
     buf::BufResult,
     io::{AsyncReadAtExt, AsyncWriteAtExt},
 };
-use compio_buf::{IntoInner, IoBuf};
+use compio_buf::{IntoInner, IoBuf, IoBufExt};
 
 pub use crate::storage::file::journal_path_for;
 use crate::storage::{
@@ -239,13 +239,9 @@ impl FileDestinationCoordinator {
         let Self {
             final_path,
             part_path,
-            lock_path,
             lock_file,
             ..
         } = self;
-        // Drop the OS lock file handle before the blocking rename: on Windows
-        // the rename might need the lock file to be closed.
-        drop(lock_file);
         compio::runtime::spawn_blocking(move || -> Result<Option<crate::core::spec::Digest>> {
             // Truncate the .part to the exact final length.
             let f = std::fs::OpenOptions::new()
@@ -323,32 +319,13 @@ impl FileDestinationCoordinator {
             if matches!(durability, crate::core::spec::Durability::CrashSafe) {
                 sync_parent_dir(&final_path)?;
             }
-            // Remove the lock file now that the transfer is done.
-            let _ = std::fs::remove_file(&lock_path);
+            // The separate lock file remains stable across jobs. Unlinking it
+            // could let another process lock a different inode for this path.
+            drop(lock_file);
             Ok(digest)
         })
         .await
         .map_err(|_| Error::destination("finalize task panicked"))?
-    }
-
-    /// Discard the `.part` and the lock file. Used on failed/aborted transfers.
-    pub async fn discard(self) -> Result<()> {
-        let part_path = self.part_path;
-        let lock_path = self.lock_path;
-        compio::runtime::spawn_blocking(move || -> Result<()> {
-            for p in [part_path.as_path(), lock_path.as_path()] {
-                match std::fs::remove_file(p) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(Error::Destination(DestinationError::Io(e)));
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| Error::destination("discard task panicked"))?
     }
 }
 
@@ -416,6 +393,67 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 pub struct FileLane {
     file: CompioFile,
     part_path: PathBuf,
+}
+
+pub(crate) const FILE_BATCH_BYTES: usize = 64 * 1024;
+pub(crate) const DIRECT_WRITE_BYTES: usize = 16 * 1024;
+
+/// One assignment's contiguous write buffer. Its entire allocation is
+/// reserved before receiving payload, so flushing never acquires memory.
+pub(crate) struct WriteBatch {
+    bytes: Vec<u8>,
+    _permit: crate::storage::transfer::MemoryPermit,
+    offset: u64,
+}
+
+impl IoBuf for WriteBatch {
+    fn as_init(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl WriteBatch {
+    pub fn new(memory: &crate::storage::MemoryBudget) -> Option<Self> {
+        let permit = memory.try_staging(FILE_BATCH_BYTES as u64)?;
+        Some(Self {
+            bytes: Vec::with_capacity(FILE_BATCH_BYTES),
+            _permit: permit,
+            offset: 0,
+        })
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn can_append(&self, chunk: &TransferChunk) -> bool {
+        self.bytes.len() + chunk.len() <= FILE_BATCH_BYTES
+            && (self.is_empty() || self.offset + self.bytes.len() as u64 == chunk.offset())
+    }
+    pub fn append(&mut self, chunk: TransferChunk) {
+        assert!(self.can_append(&chunk));
+        if self.bytes.is_empty() {
+            self.offset = chunk.offset();
+        }
+        self.bytes.extend_from_slice(chunk.as_slice());
+    }
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn discard(&mut self) -> crate::core::ByteRange {
+        let range = crate::core::ByteRange::new(self.offset, self.offset + self.len() as u64);
+        self.bytes.clear();
+        range
+    }
+    pub async fn flush(mut self, lane: &FileLane) -> Result<(Self, crate::core::ByteRange)> {
+        let range = crate::core::ByteRange::new(self.offset, self.offset + self.bytes.len() as u64);
+        let mut file = lane.file.clone();
+        let offset = self.offset;
+        let BufResult(result, batch) = file.write_all_at(self, offset).await;
+        result.map_err(|e| Error::Destination(DestinationError::Io(e)))?;
+        self = batch;
+        self.bytes.clear();
+        Ok((self, range))
+    }
 }
 
 impl FileLane {
@@ -541,4 +579,95 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use crate::{core::context::JobContext, storage::MemoryBudget};
+    use bytes::Bytes;
+
+    async fn chunk(offset: u64, len: usize, budget: &MemoryBudget) -> TransferChunk {
+        TransferChunk::bytes(
+            offset,
+            Bytes::from(vec![7; len]),
+            budget,
+            &JobContext::new(None),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn tiny_fragments_share_one_reserved_allocation_and_flush_to_the_file() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("part");
+            let lane = FileLane::open(path.clone()).await.unwrap();
+            let budget = MemoryBudget::new(2 * FILE_BATCH_BYTES as u64);
+            let mut batch = WriteBatch::new(&budget).unwrap();
+            for i in 0..64 {
+                let input = chunk(i * 1024, 1024, &budget).await;
+                assert_eq!(budget.used(), FILE_BATCH_BYTES as u64 + 1024);
+                batch.append(input);
+                assert_eq!(budget.used(), FILE_BATCH_BYTES as u64);
+            }
+            assert_eq!(batch.len(), FILE_BATCH_BYTES);
+            assert!(!batch.can_append(&chunk(FILE_BATCH_BYTES as u64, 1, &budget).await));
+            let (batch, written) = batch.flush(&lane).await.unwrap();
+            assert_eq!(
+                written,
+                crate::core::ByteRange::new(0, FILE_BATCH_BYTES as u64)
+            );
+            assert_eq!(std::fs::read(path).unwrap(), vec![7; FILE_BATCH_BYTES]);
+            assert_eq!(budget.used(), FILE_BATCH_BYTES as u64);
+            drop(batch);
+            assert_eq!(budget.used(), 0);
+        });
+    }
+
+    #[test]
+    fn discontinuous_and_parallel_batches_preserve_offsets_and_short_tails() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("part");
+            let lane = FileLane::open(path.clone()).await.unwrap();
+            let budget = MemoryBudget::new(4 * FILE_BATCH_BYTES as u64);
+            let mut first = WriteBatch::new(&budget).unwrap();
+            let mut second = WriteBatch::new(&budget).unwrap();
+            assert!(
+                WriteBatch::new(&budget).is_none(),
+                "staging leaves half for payload"
+            );
+            first.append(chunk(0, 4, &budget).await);
+            second.append(chunk(8, 4, &budget).await);
+            assert!(!first.can_append(&chunk(8, 4, &budget).await));
+            let (first, _) = first.flush(&lane).await.unwrap();
+            let (second, _) = second.flush(&lane).await.unwrap();
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                [7, 7, 7, 7, 0, 0, 0, 0, 7, 7, 7, 7]
+            );
+            drop((first, second));
+            assert_eq!(budget.used(), 0);
+        });
+    }
+
+    #[test]
+    fn failed_write_releases_the_full_staging_reservation() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("readonly");
+            std::fs::write(&path, []).unwrap();
+            let lane = FileLane {
+                file: CompioFile::open(&path).await.unwrap(),
+                part_path: path,
+            };
+            let budget = MemoryBudget::new(4 * FILE_BATCH_BYTES as u64);
+            let mut batch = WriteBatch::new(&budget).unwrap();
+            batch.append(chunk(0, 4, &budget).await);
+            assert!(batch.flush(&lane).await.is_err());
+            assert_eq!(budget.used(), 0);
+        });
+    }
 }

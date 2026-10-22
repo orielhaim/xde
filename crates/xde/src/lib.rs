@@ -14,6 +14,9 @@
 
 #![allow(dead_code, unused_imports)]
 
+#[cfg(feature = "diagnostics")]
+pub mod diagnostics;
+
 mod control;
 pub(crate) mod core;
 mod engine;
@@ -34,10 +37,13 @@ pub use engine::{DownloadBuilder, Engine, EngineBuilder};
 pub use job::Job;
 pub use progress::DownloadProgress;
 
+pub use crate::core::allocator::ResourceGrant;
 pub use crate::core::credentials::{RefreshRequest, RefreshedSource, SourceRefresher};
 pub use crate::core::events::{Event, EventStream, Protocol};
+pub use crate::core::metrics::{DestinationStats, PayloadTiming};
 pub use crate::core::policy::{
-    EngineLimits, HttpVersionPolicy, SegmentationPolicy, TransferPolicy, TransportLimits,
+    EngineLimits, HttpVersionPolicy, SchedulingPolicy, SegmentationPolicy, Topology,
+    TopologyPolicy, TransferPolicy, TransportLimits,
 };
 pub use crate::core::spec::{
     Digest, DigestCheck, Durability, ExpectedDigest, HashKind, IntegritySpec, Priority,
@@ -49,4 +55,4 @@ pub use crate::storage::{
     FlushLevel, RandomAccessDestination, ReorderingDestination, SequentialDestination,
     TransferChunk, WriteCompletion,
 };
-pub use snapshot::{EngineSnapshot, JobPhase, JobSnapshot};
+pub use snapshot::{ControllerStats, EngineSnapshot, JobPhase, JobSnapshot};

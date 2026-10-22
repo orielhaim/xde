@@ -15,12 +15,69 @@ use xde_test::{
 
 struct MemorySink {
     buf: Mutex<Vec<u8>>,
+    write_gate: Option<Gate>,
+    commit_gate: Option<Gate>,
+    fail_commit: bool,
+    panic_write: bool,
+    fail_begin: bool,
+    begin_gate: Option<Gate>,
+    began: std::sync::atomic::AtomicBool,
+}
+
+struct Gate {
+    entered: flume::Sender<()>,
+    release: flume::Receiver<()>,
+}
+
+struct GateControl {
+    entered: flume::Receiver<()>,
+    release: flume::Sender<()>,
+}
+
+impl GateControl {
+    fn wait(&self) {
+        self.entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+    }
+}
+
+impl Drop for GateControl {
+    fn drop(&mut self) {
+        let _ = self.release.try_send(());
+    }
+}
+
+fn gate() -> (Gate, GateControl) {
+    let (entered, entered_rx) = flume::bounded(1);
+    let (release_tx, release) = flume::bounded(1);
+    (
+        Gate { entered, release },
+        GateControl {
+            entered: entered_rx,
+            release: release_tx,
+        },
+    )
+}
+
+impl Gate {
+    async fn wait(&self) {
+        self.entered.send(()).unwrap();
+        self.release.recv_async().await.unwrap();
+    }
 }
 
 impl MemorySink {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             buf: Mutex::new(Vec::new()),
+            write_gate: None,
+            commit_gate: None,
+            fail_commit: false,
+            panic_write: false,
+            fail_begin: false,
+            begin_gate: None,
+            began: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -43,6 +100,11 @@ impl RandomAccessDestination for MemorySink {
     }
 
     async fn write_chunk(&self, chunk: TransferChunk) -> xde::Result<WriteCompletion> {
+        assert!(self.began.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!self.panic_write, "injected destination panic");
+        if let Some(gate) = &self.write_gate {
+            gate.wait().await;
+        }
         let offset = chunk.offset() as usize;
         let data = chunk.as_slice();
         {
@@ -68,6 +130,12 @@ impl RandomAccessDestination for MemorySink {
     }
 
     async fn commit(&self, _outcome: CommitOutcome) -> xde::Result<()> {
+        if let Some(gate) = &self.commit_gate {
+            gate.wait().await;
+        }
+        if self.fail_commit {
+            return Err(xde::Error::destination("injected commit failure"));
+        }
         Ok(())
     }
 
@@ -79,6 +147,13 @@ impl RandomAccessDestination for MemorySink {
     }
 
     async fn begin(&self, spec: BeginArtifact) -> xde::Result<()> {
+        if let Some(gate) = &self.begin_gate {
+            gate.wait().await;
+        }
+        if self.fail_begin {
+            return Err(xde::Error::destination("injected begin failure"));
+        }
+        self.began.store(true, std::sync::atomic::Ordering::Release);
         if spec.mode == ArtifactMode::Fresh {
             self.buf.lock().clear();
         }
@@ -87,6 +162,89 @@ impl RandomAccessDestination for MemorySink {
         }
         Ok(())
     }
+}
+
+#[test]
+fn commit_failure_never_reports_success() {
+    let server = spawn_h1(FixtureSpec::small());
+    let mut sink = MemorySink::new();
+    Arc::get_mut(&mut sink).unwrap().fail_commit = true;
+    let engine = test_engine();
+    let job = engine
+        .download(server.url())
+        .destination(sink)
+        .start()
+        .unwrap();
+    assert!(wait_job(job).is_err());
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn cancellation_waits_for_a_submitted_destination_write() {
+    let server = spawn_h1(FixtureSpec::small());
+    let mut sink = MemorySink::new();
+    let (write_gate, control) = gate();
+    Arc::get_mut(&mut sink).unwrap().write_gate = Some(write_gate);
+    let engine = test_engine();
+    let job = engine
+        .download(server.url())
+        .destination(sink)
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    control.wait();
+    job.cancel().unwrap();
+    assert_eq!(job.snapshot().unwrap().phase, xde::JobPhase::Cancelling);
+    let (done, result) = flume::bounded(1);
+    let waiter = std::thread::spawn(move || {
+        done.send(job.wait_blocking()).unwrap();
+    });
+    assert!(
+        result.try_recv().is_err(),
+        "write still owns the assignment"
+    );
+    drop(control);
+    assert!(matches!(
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap(),
+        Err(xde::Error::Cancelled)
+    ));
+    waiter.join().unwrap();
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn pending_custom_commit_does_not_block_another_job_or_lose_publication() {
+    let server = spawn_h1(FixtureSpec::small());
+    let mut sink = MemorySink::new();
+    let (commit_gate, control) = gate();
+    Arc::get_mut(&mut sink).unwrap().commit_gate = Some(commit_gate);
+    let engine = test_engine();
+    let job = engine
+        .download(server.url())
+        .destination(sink)
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    control.wait();
+    job.cancel().unwrap();
+    assert_eq!(job.snapshot().unwrap().phase, xde::JobPhase::Committing);
+    let env = DownloadEnv::new();
+    let other = engine
+        .download(server.url())
+        .to(&env.path)
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    assert_eq!(wait_job(other).unwrap().bytes, FixtureSpec::small().size);
+    assert_bytes_match(&env.path, FixtureSpec::small().size);
+    drop(control);
+    assert_eq!(wait_job(job).unwrap().bytes, FixtureSpec::small().size);
+    engine.shutdown().unwrap();
+    server.shutdown();
 }
 
 #[test]
@@ -185,7 +343,7 @@ fn cancel_does_not_leave_the_engine_wedged() {
     let env = DownloadEnv::new();
     let engine = test_engine();
     let job = engine.download(server.url()).to(&env.path).start().unwrap();
-    job.cancel();
+    job.cancel().unwrap();
     let err = wait_job(job);
     assert!(err.is_err(), "cancel must surface");
     engine.shutdown().ok();
@@ -216,7 +374,7 @@ fn resume_after_cancel_completes_the_file() {
             _ => {}
         }
     }
-    job.cancel();
+    job.cancel().unwrap();
     let _ = wait_job(job);
     engine.shutdown().ok();
 
@@ -242,7 +400,7 @@ fn two_jobs_same_origin_complete() {
     let b = DownloadEnv::new();
     let engine = test_engine();
     let policy = TransferPolicy {
-        initial_physical_connections: 2,
+        topology: xde::TopologyPolicy::Fixed(xde::Topology::new(2, 1)),
         transport: TransportLimits {
             max_physical_connections: 4,
             max_active_assignments: 4,
@@ -296,4 +454,110 @@ fn multi_source_quarantines_corrupt_mirror() {
     engine.shutdown().ok();
     good.shutdown();
     bad.shutdown();
+}
+
+#[test]
+fn destination_panic_fails_its_job_and_the_engine_remains_usable() {
+    let server = spawn_h1(FixtureSpec::small());
+    let mut sink = MemorySink::new();
+    Arc::get_mut(&mut sink).unwrap().panic_write = true;
+    let engine = test_engine();
+    let job = engine
+        .download(server.url())
+        .destination(sink)
+        .start()
+        .unwrap();
+    assert!(wait_job(job).is_err());
+    let env = DownloadEnv::new();
+    let job = engine.download(server.url()).to(&env.path).start().unwrap();
+    assert_eq!(wait_job(job).unwrap().bytes, FixtureSpec::small().size);
+    assert_bytes_match(&env.path, FixtureSpec::small().size);
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn failed_destination_preparation_never_starts_a_request() {
+    let server = spawn_h1(FixtureSpec::small());
+    let engine = test_engine();
+    let mut sink = MemorySink::new();
+    Arc::get_mut(&mut sink).unwrap().fail_begin = true;
+    let job = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .start()
+        .unwrap();
+    assert!(wait_job(job).is_err());
+    assert!(sink.buf.lock().is_empty());
+    assert_eq!(
+        server
+            .stats
+            .requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    engine.shutdown().unwrap();
+}
+
+#[test]
+fn cancellation_drains_destination_preparation_without_starting_transfer() {
+    let server = spawn_h1(FixtureSpec::small());
+    let engine = test_engine();
+    let (gate, control) = gate();
+    let mut sink = MemorySink::new();
+    Arc::get_mut(&mut sink).unwrap().begin_gate = Some(gate);
+    let job = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .start()
+        .unwrap();
+    control.wait();
+    job.cancel().unwrap();
+    assert_eq!(job.snapshot().unwrap().phase, xde::JobPhase::Cancelling);
+    drop(control);
+    assert!(matches!(wait_job(job), Err(xde::Error::Cancelled)));
+    assert_eq!(
+        server
+            .stats
+            .requests
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    engine.shutdown().unwrap();
+}
+
+#[test]
+fn one_custom_destination_has_one_active_lease() {
+    let server = spawn_h1(FixtureSpec::small());
+    let engine = test_engine();
+    let (gate, control) = gate();
+    let mut sink = MemorySink::new();
+    Arc::get_mut(&mut sink).unwrap().begin_gate = Some(gate);
+    let first = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .start()
+        .unwrap();
+    control.wait();
+    let second = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .start();
+    let rejected = second.is_err();
+    first.cancel().unwrap();
+    // Drain both callbacks even when the admission assertion regresses.
+    if let Ok(second) = second {
+        second.cancel().unwrap();
+        control.release.send(()).unwrap();
+        control.release.send(()).unwrap();
+        assert!(wait_job(second).is_err());
+    } else {
+        control.release.send(()).unwrap();
+    }
+    assert!(wait_job(first).is_err());
+    engine.shutdown().unwrap();
+    assert!(
+        rejected,
+        "the same destination Arc cannot initialize two jobs concurrently"
+    );
 }

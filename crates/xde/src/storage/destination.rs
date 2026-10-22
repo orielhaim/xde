@@ -24,6 +24,11 @@ pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// `impl AsyncWrite` is the wrong abstraction for a segmented transfer: the
 /// bytes arrive in the order `900MB, 0, 3GB, 500MB`.
 pub trait RandomAccessDestination {
+    #[cfg(feature = "diagnostics")]
+    fn diagnostic_stage(&self) -> Option<crate::diagnostics::Stage> {
+        None
+    }
+
     fn caps(&self) -> DestinationCaps;
     fn hints(&self) -> DestinationHints;
 
@@ -72,6 +77,11 @@ pub trait SequentialDestination {
 /// clean `impl Trait` version above and gets this one for free via the blanket
 /// impl below.
 pub trait DynDestination {
+    #[cfg(feature = "diagnostics")]
+    fn diagnostic_stage(&self) -> Option<crate::diagnostics::Stage> {
+        None
+    }
+
     fn caps(&self) -> DestinationCaps;
     fn hints(&self) -> DestinationHints;
 
@@ -89,6 +99,10 @@ impl<T> DynDestination for T
 where
     T: RandomAccessDestination + 'static,
 {
+    #[cfg(feature = "diagnostics")]
+    fn diagnostic_stage(&self) -> Option<crate::diagnostics::Stage> {
+        RandomAccessDestination::diagnostic_stage(self)
+    }
     fn caps(&self) -> DestinationCaps {
         RandomAccessDestination::caps(self)
     }

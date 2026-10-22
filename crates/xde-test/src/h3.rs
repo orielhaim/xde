@@ -6,7 +6,7 @@ use std::{
     net::TcpListener,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
@@ -44,16 +44,7 @@ pub fn spawn_h1h3(spec: FixtureSpec) -> DualH3 {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let stats: SharedStats = Arc::new(FixtureStats::default());
     let stop = Arc::new(AtomicBool::new(false));
-    let payload_h3: Bytes = {
-        let mut v = vec![0u8; spec.size.min(1024 * 1024) as usize];
-        if v.is_empty() {
-            v = vec![0u8; 1];
-        }
-        payload::fill(&mut v, 0);
-        // H3 fixture streams from the repeating tile via payload::fill on
-        // each chunk; the Bytes here is only a 1 MiB tile.
-        Bytes::from(payload::tile())
-    };
+    let payload_h3 = Bytes::from(payload::tile());
 
     let params = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()])
         .expect("rcgen params");
@@ -65,7 +56,8 @@ pub fn spawn_h1h3(spec: FixtureSpec) -> DualH3 {
     let h3_thread = {
         let stop = stop.clone();
         let payload = payload_h3.clone();
-        let size = spec.size;
+        let h3_spec = spec.clone();
+        let stats = stats.clone();
         thread::spawn(move || {
             let rt = compio::runtime::Runtime::new().expect("h3 runtime");
             rt.block_on(async move {
@@ -102,28 +94,43 @@ pub fn spawn_h1h3(spec: FixtureSpec) -> DualH3 {
                         Ok(connecting) => {
                             let payload = payload.clone();
                             let stop = stop.clone();
+                            let stats = stats.clone();
+                            let spec = h3_spec.clone();
                             compio::runtime::spawn(async move {
                                 if let Ok(conn) = connecting.await
                                     && let Ok(mut h3_conn) =
                                         h3::server::builder().build::<_, Bytes>(conn).await
                                 {
+                                    stats.h3_connections.fetch_add(1, Ordering::AcqRel);
+                                    let active = Arc::new(AtomicUsize::new(0));
                                     while let Ok(Some(resolver)) = h3_conn.accept().await {
                                         if stop.load(Ordering::Acquire) {
                                             break;
                                         }
-                                        let Ok((request, mut stream)) =
-                                            resolver.resolve_request().await
-                                        else {
-                                            break;
-                                        };
-                                        serve_h3(
-                                            &mut stream,
-                                            &payload,
-                                            size,
-                                            request,
-                                            stop.clone(),
-                                        )
-                                        .await;
+                                        let payload = payload.clone();
+                                        let stop = stop.clone();
+                                        let stats = stats.clone();
+                                        let active = active.clone();
+                                        let spec = spec.clone();
+                                        compio::runtime::spawn(async move {
+                                            let Ok((request, mut stream)) =
+                                                resolver.resolve_request().await
+                                            else {
+                                                return;
+                                            };
+                                            let guard = ActiveStream::new(active, stats.clone());
+                                            serve_h3(
+                                                &mut stream,
+                                                &payload,
+                                                &spec,
+                                                request,
+                                                stop,
+                                                &stats,
+                                            )
+                                            .await;
+                                            drop(guard);
+                                        })
+                                        .detach();
                                     }
                                 }
                             })
@@ -228,6 +235,9 @@ fn serve_h1_advertise(
                 return;
             }
             stats.bytes_sent.fetch_add(take as u64, Ordering::AcqRel);
+            stats
+                .h3_payload_bytes
+                .fetch_add(take as u64, Ordering::AcqRel);
             offset += take as u64;
         }
         if !spec.keep_alive {
@@ -259,22 +269,33 @@ async fn serve_h3(
         Bytes,
     >,
     tile: &Bytes,
-    total: u64,
+    spec: &FixtureSpec,
     request: http::Request<()>,
     stop: Arc<AtomicBool>,
+    stats: &FixtureStats,
 ) {
-    let range = request.headers().get("range").and_then(|v| {
-        let v = v.to_str().ok()?;
-        let v = v.strip_prefix("bytes=")?;
-        let (s, e) = v.split_once('-')?;
-        let start: u64 = s.parse().ok()?;
-        let end: u64 = if e.is_empty() {
-            total.saturating_sub(1)
-        } else {
-            e.parse().ok()?
-        };
-        Some((start, end.min(total.saturating_sub(1))))
-    });
+    let total = spec.size;
+    let nth = stats.h3_requests.fetch_add(1, Ordering::AcqRel) as u32 + 1;
+    if !spec.latency.is_zero() {
+        compio::time::sleep(spec.latency).await;
+    }
+    while let Ok(Some(_)) = stream.recv_data().await {}
+    let range = request
+        .headers()
+        .get("range")
+        .and_then(|v| {
+            let v = v.to_str().ok()?;
+            let v = v.strip_prefix("bytes=")?;
+            let (s, e) = v.split_once('-')?;
+            let start: u64 = s.parse().ok()?;
+            let end: u64 = if e.is_empty() {
+                total.saturating_sub(1)
+            } else {
+                e.parse().ok()?
+            };
+            (start < total && start <= end).then_some((start, end.min(total.saturating_sub(1))))
+        })
+        .filter(|_| spec.ranges.honors(nth));
     let resp_head = match range {
         Some((start, end)) => {
             let end = end.min(total.saturating_sub(1));
@@ -300,12 +321,19 @@ async fn serve_h3(
         (s, e.min(total.saturating_sub(1)))
     });
     let mut offset = start;
-    while offset <= end && !stop.load(Ordering::Acquire) {
+    let mut pacing = spec.egress.as_ref().map(|budget| budget.session());
+    while offset < total && offset <= end && !stop.load(Ordering::Acquire) {
         let block_len = tile.len();
         let in_block = (offset % block_len as u64) as usize;
         let take = ((end - offset + 1) as usize)
             .min(64 * 1024)
             .min(block_len - in_block);
+        if let Some(egress) = &mut pacing {
+            let wait = egress.delay(take, (end - offset + 1) as usize);
+            if !wait.is_zero() {
+                compio::time::sleep(wait).await;
+            }
+        }
         if stream
             .send_data(tile.slice(in_block..in_block + take))
             .await
@@ -313,7 +341,28 @@ async fn serve_h3(
         {
             return;
         }
+        stats
+            .h3_payload_bytes
+            .fetch_add(take as u64, Ordering::AcqRel);
         offset += take as u64;
     }
     let _ = stream.finish().await;
+}
+
+struct ActiveStream {
+    active: Arc<AtomicUsize>,
+}
+impl ActiveStream {
+    fn new(active: Arc<AtomicUsize>, stats: SharedStats) -> Self {
+        let count = active.fetch_add(1, Ordering::AcqRel) + 1;
+        stats
+            .h3_peak_streams_per_connection
+            .fetch_max(count, Ordering::AcqRel);
+        Self { active }
+    }
+}
+impl Drop for ActiveStream {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }

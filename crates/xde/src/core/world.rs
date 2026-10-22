@@ -52,32 +52,56 @@ pub enum AddressFamily {
     V6,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPhase {
     /// Admitted, resolution pending.
     Created,
     /// Probe in flight on an open connection.
     Probing,
+    /// Custom destination initialization owns the lease until acknowledgement.
+    Preparing,
+    StoppingPreparation(JobFailure),
     /// Fetching bytes.
     Transferring,
+    Pausing,
+    Paused,
     /// All ranges verified; final integrity pass / commit in progress.
     Committing,
-    Completed,
-    Cancelling,
-    /// Terminal failure in progress: no new claims, drain in-flight work,
-    /// then release the destination lease.
-    Failing,
-    Failed,
+    /// Retire the current writers before replacing the representation plan.
+    Restarting,
+    /// The failure owns the terminal decision while outstanding I/O drains.
+    Stopping(JobFailure),
 }
 
 impl JobPhase {
-    pub fn is_terminal(self) -> bool {
-        matches!(self, JobPhase::Completed | JobPhase::Failed)
-    }
-
     /// No new work may be claimed.
-    pub fn is_draining(self) -> bool {
-        matches!(self, JobPhase::Cancelling | JobPhase::Failing)
+    pub fn is_draining(&self) -> bool {
+        matches!(
+            self,
+            JobPhase::Stopping(_)
+                | JobPhase::Restarting
+                | JobPhase::Pausing
+                | JobPhase::StoppingPreparation(_)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobFailure {
+    Cancelled,
+    DeadlineExceeded,
+    Failed(String),
+}
+
+impl From<String> for JobFailure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for JobFailure {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
     }
 }
 
@@ -87,6 +111,7 @@ impl JobPhase {
 #[derive(Debug)]
 pub struct JobNode {
     pub id: JobId,
+    pub admission_order: u64,
     pub artifact: ArtifactId,
     /// Every source that can serve this artifact, in application-declared
     /// preference order. One artifact, many sources.
@@ -144,12 +169,18 @@ pub struct JobNode {
     /// caps, which gate segmented transfer and parallelism.
     pub sink_caps: crate::core::sink::DestinationCaps,
     pub sink_hints: crate::core::sink::DestinationHints,
-    /// Set when the job is draining toward a terminal result. Applied once
-    /// in-flight assignments hit zero.
-    pub pending_terminal: Option<Result<(u64, Option<crate::core::spec::Digest>), String>>,
+    pub plan_id: crate::core::ids::PlanId,
     /// WFQ virtual service: normalized bytes delivered (bytes / eff_weight).
     /// Jobs with smaller virt_service are picked first.
     pub virt_service: f64,
+    pub planner_due: Option<Instant>,
+    pub planner: crate::core::planner::JobPlanner,
+    pub grant: crate::core::allocator::ResourceGrant,
+    pub activated: bool,
+    pub useful_bytes: u64,
+    pub previous_local: (Duration, Duration),
+    pub local_blocked: Duration,
+    pub sample_wall: Duration,
 }
 
 /// Capability set of the built-in file destination: everything a positional
@@ -215,6 +246,7 @@ pub enum ConnectionStatus {
 
 #[derive(Debug)]
 pub struct ConnectionNode {
+    pub owner: Option<JobId>,
     pub id: ConnectionId,
     pub origin: OriginId,
     pub endpoint: EndpointId,
@@ -274,30 +306,6 @@ pub struct OriginNode {
     /// The origin's DNS HTTPS/SVCB records advertise HTTP/3 (alpn=h3).
     /// Discovery signal only - the controller still probes before trusting.
     pub advertises_h3: bool,
-    /// Adaptive topology state: how many physical connections the
-    /// controller currently believes are useful for this origin.
-    pub adaptive_target_conns: usize,
-    /// Adaptive topology state: how many concurrent streams the controller
-    /// currently allows per multiplexed (H2/H3) connection. H1 connections
-    /// always carry exactly one request regardless of this value.
-    pub adaptive_target_streams: u32,
-    /// Cumulative verified bytes when the current measurement window opened.
-    pub last_window_bytes: u64,
-    pub last_window_at: Instant,
-    /// Recent aggregate window rates (B/s), oldest first, capped - the
-    /// dispersion of this series is the noise floor for keep/revert
-    /// decisions.
-    pub window_rates: Vec<f64>,
-    /// Whether the adaptive loop is running for this origin.
-    pub adaptive_active: bool,
-    /// Active topology experiment: the variable under test, its baseline
-    /// rate, and when it started. Cleared on keep or revert.
-    pub topology_experiment: Option<TopologyExperiment>,
-    /// The variable adjusted by the previous experiment; the next one picks
-    /// the other variable first so neither dominates exploration.
-    pub last_experiment_variable: Option<TopologyVariable>,
-    /// No new experiments until this instant (hysteresis after revert).
-    pub experiment_cooldown_until: Option<Instant>,
     /// Failed H3 dials to this origin. Drives exponential retry backoff:
     /// broken advertisements or blocked UDP must not be re-probed for
     /// every range.
@@ -306,38 +314,6 @@ pub struct OriginNode {
     pub h3_retry_after: Option<Instant>,
     /// UDP port where the origin advertised HTTP/3 via Alt-Svc or SVCB.
     pub h3_alt_port: Option<u16>,
-}
-
-/// Which control knob an experiment adjusts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopologyVariable {
-    /// One more physical connection to this origin.
-    Connection,
-    /// One more concurrent stream per multiplexed connection.
-    Streams,
-}
-
-impl TopologyVariable {
-    /// The variable to try next, given what was tried last.
-    pub fn next_after(last: Option<TopologyVariable>) -> Self {
-        match last {
-            Some(TopologyVariable::Connection) => TopologyVariable::Streams,
-            Some(TopologyVariable::Streams) => TopologyVariable::Connection,
-            None => TopologyVariable::Connection,
-        }
-    }
-}
-
-/// One adaptive topology experiment in flight.
-#[derive(Debug)]
-pub struct TopologyExperiment {
-    pub variable: TopologyVariable,
-    pub conn: Option<ConnectionId>,
-    pub baseline_rate_bps: f64,
-    pub opened_at: Instant,
-    pub measure_start_at: Option<Instant>,
-    pub measure_start_bytes: u64,
-    pub measured_rate_bps: Option<f64>,
 }
 
 impl OriginNode {
@@ -401,9 +377,25 @@ pub struct SourceNode {
     pub origin: OriginId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum DestinationKey {
+    File(std::path::PathBuf),
+    /// The destination Arc remains alive for the entire lease.
+    Shared(usize),
+}
+
+impl std::fmt::Display for DestinationKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(path) => path.display().fmt(formatter),
+            Self::Shared(_) => formatter.write_str("custom destination"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DestinationNode {
-    pub key: String,
+    pub key: DestinationKey,
     /// Job currently holding the exclusive lease, if any.
     pub leased_by: Option<JobId>,
 }
@@ -430,8 +422,9 @@ pub struct WorldModel {
     /// The context the engine currently operates in.
     pub current_context: Option<NetworkContextId>,
     pub destinations: SlotMap<DestinationId, DestinationNode>,
-    pub destination_index: HashMap<String, DestinationId>,
+    pub destination_index: HashMap<DestinationKey, DestinationId>,
     pub origin_index: HashMap<TransportOriginKey, OriginId>,
+    next_job_order: u64,
     pending_learning: Option<crate::core::profile::PersistedProfile>,
 }
 
@@ -450,7 +443,7 @@ impl WorldModel {
     pub fn admit_job(
         &mut self,
         spec: &JobSpec,
-        destination_key: String,
+        destination_key: DestinationKey,
     ) -> Result<(JobId, ArtifactId), DestinationLeaseError> {
         let dest_id = match self.destination_index.get(&destination_key) {
             Some(&id) => {
@@ -501,7 +494,10 @@ impl WorldModel {
         }
         let origin_id = primary_origin.expect("checked non-empty above");
 
+        let admission_order = self.next_job_order;
+        self.next_job_order += 1;
         let job = self.jobs.insert_with_key(|id| JobNode {
+            admission_order,
             id,
             artifact,
             active_sources: vec![source_ids[0]],
@@ -532,8 +528,19 @@ impl WorldModel {
             sampling_sources: Vec::new(),
             sink_caps: crate::core::world::file_sink_caps(),
             sink_hints: Default::default(),
-            pending_terminal: None,
+            plan_id: crate::core::ids::PlanId::default(),
             virt_service: 0.0,
+            planner_due: None,
+            planner: crate::core::planner::JobPlanner::new(
+                spec.policy.topology,
+                spec.policy.transport,
+            ),
+            grant: Default::default(),
+            activated: false,
+            useful_bytes: 0,
+            previous_local: (Duration::ZERO, Duration::ZERO),
+            local_blocked: Duration::ZERO,
+            sample_wall: Duration::ZERO,
         });
 
         if let Some(d) = self.destinations.get_mut(dest_id) {
@@ -600,18 +607,9 @@ impl WorldModel {
             supports_ranges: None,
             endpoint_failures: SecondaryMap::new(),
             advertises_h3: false,
-            adaptive_target_conns: 1,
-            adaptive_target_streams: 1,
-            last_window_bytes: 0,
-            last_window_at: Instant::now(),
-            window_rates: Vec::new(),
-            adaptive_active: false,
-            topology_experiment: None,
             h3_failures: 0,
             h3_retry_after: None,
             h3_alt_port: None,
-            last_experiment_variable: None,
-            experiment_cooldown_until: None,
         });
         self.origin_index.insert(key, id);
         self.apply_pending_learning(id);
@@ -694,6 +692,7 @@ impl WorldModel {
         // Protocol is unknown until the handshake negotiates it; the
         // controller records the result at ConnectionReady time.
         let id = self.connections.insert_with_key(|id| ConnectionNode {
+            owner: None,
             id,
             origin,
             endpoint,
@@ -1123,7 +1122,7 @@ impl WorldModel {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DestinationLeaseError {
-    Busy(String),
+    Busy(DestinationKey),
     NoSource,
 }
 

@@ -43,7 +43,11 @@ pub async fn open_h3(
     remote: std::net::SocketAddr,
     server_name: &str,
     cfg: Option<compio_quic::ClientConfig>,
-) -> Result<(H3SendRequest, compio_quic::Connection)> {
+) -> Result<(
+    H3SendRequest,
+    compio_quic::Connection,
+    compio::runtime::JoinHandle<()>,
+)> {
     let connecting = endpoint
         .connect(remote, server_name, cfg)
         .map_err(|e| Error::Transport(TransportError::Tls(format!("quic connect: {e}"))))?;
@@ -70,11 +74,10 @@ pub async fn open_h3(
             })
         })?;
     // Drive control streams until the connection dies.
-    compio::runtime::spawn(async move {
+    let driver = compio::runtime::spawn(async move {
         let _ = driver.wait_idle().await;
-    })
-    .detach();
-    Ok((send_request, conn))
+    });
+    Ok((send_request, conn, driver))
 }
 
 /// A response head plus a protocol-agnostic streaming DATA source.
@@ -94,9 +97,11 @@ pub struct BodyWireStats {
     pub copied_bytes: u64,
     pub pending: Duration,
     pub max_gap: Duration,
-    frame_sizes: Vec<u32>,
+    frame_sizes: [u64; 32],
+    frame_bytes: u64,
     pending_since: Option<Instant>,
     last_frame: Option<Instant>,
+    pub first_payload: Option<Instant>,
 }
 
 impl BodyWireStats {
@@ -107,10 +112,20 @@ impl BodyWireStats {
         if let Some(last) = self.last_frame {
             self.max_gap = self.max_gap.max(last.elapsed());
         }
-        self.last_frame = Some(Instant::now());
+        let now = Instant::now();
+        self.last_frame = Some(now);
+        if len > 0 && self.first_payload.is_none() {
+            self.first_payload = Some(now);
+        }
         self.data_frames += 1;
-        self.frame_sizes
-            .push(u32::try_from(len).unwrap_or(u32::MAX));
+        let size = len.min(u32::MAX as usize) as u64;
+        let bucket = if size <= 1 {
+            0
+        } else {
+            (64 - (size - 1).leading_zeros()) as usize
+        };
+        self.frame_sizes[bucket.min(31)] += 1;
+        self.frame_bytes += size;
     }
 
     fn note_pending(&mut self) {
@@ -119,22 +134,30 @@ impl BodyWireStats {
         }
     }
 
+    /// Upper bound of the power-of-two bucket containing this percentile.
     pub fn frame_percentile(&self, p: f64) -> u32 {
-        if self.frame_sizes.is_empty() {
-            return 0;
-        }
-        let mut v = self.frame_sizes.clone();
-        v.sort_unstable();
-        let i = ((p / 100.0) * (v.len() as f64 - 1.0)).round() as usize;
-        v[i.min(v.len() - 1)]
-    }
-
-    pub fn avg_frame(&self) -> u32 {
         if self.data_frames == 0 {
             return 0;
         }
-        let sum: u64 = self.frame_sizes.iter().map(|s| u64::from(*s)).sum();
-        (sum / self.data_frames) as u32
+        let target = (self.data_frames as f64 * p.clamp(0.0, 100.0) / 100.0)
+            .ceil()
+            .max(1.0) as u64;
+        let mut count = 0;
+        for (bucket, samples) in self.frame_sizes.iter().enumerate() {
+            count += samples;
+            if count >= target {
+                return if bucket == 31 {
+                    u32::MAX
+                } else {
+                    1u32 << bucket
+                };
+            }
+        }
+        0
+    }
+
+    pub fn avg_frame(&self) -> u32 {
+        self.frame_bytes.checked_div(self.data_frames).unwrap_or(0) as u32
     }
 }
 
@@ -172,21 +195,30 @@ impl WireBody {
             WireBodyInner::Hyper(body) => {
                 std::future::poll_fn(|cx| poll_hyper_frame(body, &mut self.stats, cx)).await
             }
-            WireBodyInner::H3(stream) => match stream.recv_data().await {
-                Ok(Some(mut buf)) => {
-                    let n = buf.remaining();
-                    self.stats.note_frame(n);
-                    // h3 `Buf` is not `Bytes`; copy_to_bytes is the protocol
-                    // boundary until quic/h3 yields owned Bytes.
-                    self.stats.copy_count += 1;
-                    self.stats.copied_bytes += n as u64;
-                    Ok(Some(buf.copy_to_bytes(n)))
-                }
-                Ok(None) => Ok(None),
-                Err(e) => Err(Error::Transport(TransportError::ConnectionRetired {
-                    reason: format!("h3 body error: {e}"),
-                })),
-            },
+            WireBodyInner::H3(stream) => {
+                std::future::poll_fn(|cx| {
+                    match stream.poll_recv_data(cx) {
+                        std::task::Poll::Pending => {
+                            self.stats.note_pending();
+                            std::task::Poll::Pending
+                        }
+                        std::task::Poll::Ready(Ok(Some(mut buf))) => {
+                            let len = buf.remaining();
+                            self.stats.note_frame(len);
+                            // h3's BufList::take_chunk returns Bytes; this handoff
+                            // retains the allocation rather than copying payload.
+                            std::task::Poll::Ready(Ok(Some(buf.copy_to_bytes(len))))
+                        }
+                        std::task::Poll::Ready(Ok(None)) => std::task::Poll::Ready(Ok(None)),
+                        std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(
+                            Error::Transport(TransportError::ConnectionRetired {
+                                reason: format!("h3 body error: {error}"),
+                            }),
+                        )),
+                    }
+                })
+                .await
+            }
         }
     }
 
@@ -290,6 +322,10 @@ pub async fn send_get(
             })?;
             let send_ready = t0.elapsed();
             let mut stream = Box::pin(stream);
+            stream
+                .finish()
+                .await
+                .map_err(|error| Error::protocol(format!("h3 request finish: {error}")))?;
             let t1 = Instant::now();
             let resp = stream.recv_response().await.map_err(|e| {
                 Error::Transport(TransportError::ConnectionRetired {

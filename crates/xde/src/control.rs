@@ -7,7 +7,7 @@
 //! this file is routing and I/O glue only.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::Arc,
     thread::{self, JoinHandle},
@@ -41,7 +41,7 @@ pub struct JobOutcome {
 
 pub struct ControlCommand {
     pub spec: Box<crate::core::JobSpec>,
-    pub destination_key: String,
+    pub destination_key: crate::core::world::DestinationKey,
     pub final_path: Option<PathBuf>,
     /// Application-provided shared destination (custom sink). When set,
     /// `final_path`/coordinator/journal/resume are all bypassed.
@@ -51,37 +51,53 @@ pub struct ControlCommand {
     /// Not `Debug`: refreshers may hold secrets; they are never logged.
     pub refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
     pub progress: Option<crate::progress::ProgressPublisher>,
-    /// Graceful shutdown request (spec fields unused when set).
-    pub shutdown: bool,
     /// Admission reply: JobId or the lease-conflict error.
     pub admit_tx: Sender<Result<JobId>>,
     /// Final outcome channel.
     pub result_tx: Sender<Result<JobOutcome>>,
 }
 
+enum ControlRequest {
+    Submit(Box<ControlCommand>),
+    Shutdown,
+    Pause {
+        job: JobId,
+        reply: Sender<Result<()>>,
+    },
+    Resume {
+        job: JobId,
+        reply: Sender<Result<()>>,
+    },
+}
+
 /// Per-job execution state owned by the control thread.
 struct JobState {
     result_tx: Sender<Result<JobOutcome>>,
+    admission: Option<(Box<crate::core::JobSpec>, Option<Box<ResumeEvidence>>)>,
     context: JobContext,
-    coordinator: Option<FileDestinationCoordinator>,
+    destination: DestinationState,
     part_path: PathBuf,
     /// This destination's crash-recovery journal, loaded at admission and
     /// updated as verified ranges arrive. Persisted per the durability
     /// policy; removed on successful commit.
     journal: Option<Journal>,
-    /// Shared custom destination, when the job was admitted with one.
-    shared: Option<Arc<dyn crate::storage::DynDestination + Send + Sync>>,
     /// Application-provided credential refresher, if any.
     refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
     progress: Option<crate::progress::ProgressPublisher>,
     provenance: std::sync::Arc<std::sync::Mutex<crate::core::ArtifactProvenance>>,
 }
 
+enum DestinationState {
+    File(FileDestinationCoordinator),
+    Custom(Arc<dyn crate::storage::DynDestination + Send + Sync>),
+    Committing,
+}
+
 /// Handle held by the public Engine.
 #[derive(Clone)]
 pub struct ControlHandle {
-    tx: Sender<ControlCommand>,
-    cancel_tx: Sender<JobId>,
+    tx: Sender<ControlRequest>,
+    cancel_tx: Sender<(JobId, Sender<()>)>,
     status_tx: flume::Sender<StatusRequest>,
 }
 
@@ -104,45 +120,47 @@ impl std::fmt::Debug for ControlHandle {
 
 impl ControlHandle {
     pub fn submit(&self, cmd: ControlCommand) -> Result<()> {
-        self.tx.try_send(cmd).map_err(|e| match e {
-            TrySendError::Full(_) => Error::Runtime(crate::core::RuntimeError::EngineBusy),
-            TrySendError::Disconnected(_) => Error::Runtime(crate::core::RuntimeError::EngineGone),
-        })
+        self.tx
+            .try_send(ControlRequest::Submit(Box::new(cmd)))
+            .map_err(|e| match e {
+                TrySendError::Full(_) => Error::Runtime(crate::core::RuntimeError::EngineBusy),
+                TrySendError::Disconnected(_) => {
+                    Error::Runtime(crate::core::RuntimeError::EngineGone)
+                }
+            })
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        let (admit_tx, _admit_rx) = flume::bounded(1);
-        let (result_tx, result_rx) = flume::bounded(1);
-        let sent = self.tx.send_timeout(
-            ControlCommand {
-                spec: Box::new(crate::core::JobSpec::new(
-                    url::Url::parse("about:xde-shutdown").expect("static url"),
-                )),
-                destination_key: String::new(),
-                final_path: None,
-                shared_destination: None,
-                refresher: None,
-                progress: None,
-                shutdown: true,
-                admit_tx,
-                result_tx,
-            },
-            std::time::Duration::from_secs(10),
-        );
-        drop(result_rx);
-        sent.map_err(|e| match e {
-            flume::SendTimeoutError::Timeout(_) => {
-                Error::Runtime(crate::core::RuntimeError::EngineBusy)
-            }
-            flume::SendTimeoutError::Disconnected(_) => {
-                Error::Runtime(crate::core::RuntimeError::EngineGone)
-            }
-        })
+        self.tx
+            .send(ControlRequest::Shutdown)
+            .map_err(|_| Error::Runtime(crate::core::RuntimeError::EngineGone))
+    }
+
+    pub(crate) fn pause(&self, job: JobId, resume: bool) -> Result<()> {
+        let (reply, done) = flume::bounded(1);
+        let command = if resume {
+            ControlRequest::Resume { job, reply }
+        } else {
+            ControlRequest::Pause { job, reply }
+        };
+        self.tx
+            .try_send(command)
+            .map_err(|_| Error::Runtime(crate::core::RuntimeError::EngineBusy))?;
+        done.recv()
+            .map_err(|_| Error::Runtime(crate::core::RuntimeError::EngineGone))?
     }
 
     pub(crate) fn cancel(&self, job: JobId) -> Result<()> {
+        let (ack, done) = flume::bounded(1);
         self.cancel_tx
-            .try_send(job)
+            .try_send((job, ack))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => Error::Runtime(crate::core::RuntimeError::EngineBusy),
+                TrySendError::Disconnected(_) => {
+                    Error::Runtime(crate::core::RuntimeError::EngineGone)
+                }
+            })?;
+        done.recv()
             .map_err(|_| Error::Runtime(crate::core::RuntimeError::EngineGone))
     }
 
@@ -165,8 +183,34 @@ impl ControlHandle {
         reply_rx.recv().ok()
     }
 }
+struct Cleanup {
+    shard: usize,
+    command: CleanupCommand,
+}
+
+#[derive(Clone)]
+enum CleanupCommand {
+    Release { job: JobId, part_path: PathBuf },
+    Close(ConnectionId),
+}
+impl CleanupCommand {
+    fn command(&self) -> ShardCommand {
+        match self {
+            Self::Release { job, part_path } => ShardCommand::ReleaseJob {
+                job: *job,
+                part_path: part_path.clone(),
+            },
+            Self::Close(connection) => ShardCommand::CloseConnection {
+                connection: *connection,
+            },
+        }
+    }
+}
+
 struct Loop {
+    cleanup: VecDeque<Cleanup>,
     controller: Controller,
+    pending: VecDeque<Observation>,
     timers: TimerQueue,
     jobs: HashMap<JobId, JobState>,
     obs_tx: Sender<Observation>,
@@ -185,8 +229,8 @@ struct Loop {
 struct LoopArgs {
     shards: usize,
     limits: crate::core::policy::EngineLimits,
-    cmd_rx: Receiver<ControlCommand>,
-    cancel_rx: Receiver<JobId>,
+    cmd_rx: Receiver<ControlRequest>,
+    cancel_rx: Receiver<(JobId, Sender<()>)>,
     obs_rx: Receiver<Observation>,
     obs_tx: Sender<Observation>,
     shard_txs: Vec<Sender<ShardCommand>>,
@@ -220,7 +264,7 @@ impl ControlPlane {
     ) -> (ControlHandle, JoinHandle<()>) {
         let (cmd_tx, cmd_rx) = flume::bounded(64);
         let (cancel_tx, cancel_rx) = flume::bounded(256);
-        let (status_tx, status_rx) = flume::unbounded::<StatusRequest>();
+        let (status_tx, status_rx) = flume::bounded::<StatusRequest>(64);
         let handle = ControlHandle {
             tx: cmd_tx,
             cancel_tx,
@@ -267,6 +311,8 @@ fn run_loop(args: LoopArgs) {
     } = args;
     let mut lp = Loop {
         controller: Controller::with_shards(shards),
+        pending: VecDeque::new(),
+        cleanup: VecDeque::new(),
         timers: TimerQueue::new(),
         jobs: HashMap::new(),
         // The loop holds no clone of obs_tx: dropping the engine disconnects
@@ -291,68 +337,126 @@ fn run_loop(args: LoopArgs) {
         lp.controller.world.import_profiles(&profile);
     }
 
+    enum Input {
+        Command(std::result::Result<ControlRequest, flume::RecvError>),
+        Cancel(std::result::Result<(JobId, Sender<()>), flume::RecvError>),
+        Status(std::result::Result<StatusRequest, flume::RecvError>),
+        Observation(std::result::Result<Observation, flume::RecvError>),
+        Cleanup(usize),
+    }
     let mut shutdown = false;
     loop {
-        // 1. Admissions (synchronous so submit() gets its JobId).
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            if cmd.shutdown {
-                shutdown = true;
-                continue;
-            }
-            admit_command(&mut lp, cmd);
+        if shutdown && lp.jobs.is_empty() && lp.cleanup.is_empty() {
+            break;
         }
-        // Explicit graceful shutdown: cancel every active job. The
-        // cancellation path checkpoints journals, so resumable state is
-        // persisted before the loop exits. Any job unknown to the
-        // controller (mid-cancellation already) is answered by the drain
-        // after the loop.
-        let mut terminate = false;
-        if shutdown {
-            for job in lp.jobs.keys().copied().collect::<Vec<_>>() {
-                tracing::info!(target: "xde::engine", ?job, "shutdown cancel");
+        let input = if let Some(observation) = lp.pending.pop_front() {
+            Some(Input::Observation(Ok(observation)))
+        } else {
+            let mut selector = flume::Selector::new()
+                .recv(&cmd_rx, Input::Command)
+                .recv(&cancel_rx, Input::Cancel)
+                .recv(&lp.status_rx, Input::Status)
+                .recv(&obs_rx, Input::Observation);
+            let mut selected = vec![false; lp.shard_txs.len()];
+            for (index, cleanup) in lp.cleanup.iter().enumerate() {
+                if selected[cleanup.shard] {
+                    continue;
+                }
+                selected[cleanup.shard] = true;
+                selector = selector.send(
+                    &lp.shard_txs[cleanup.shard],
+                    cleanup.command.command(),
+                    move |_| Input::Cleanup(index),
+                );
+            }
+            if let Some(deadline) = lp.timers.next_deadline() {
+                selector.wait_deadline(deadline).ok()
+            } else {
+                Some(selector.wait())
+            }
+        };
+        match input {
+            Some(Input::Cleanup(index)) => {
+                lp.cleanup.remove(index);
+            }
+
+            Some(Input::Command(Ok(ControlRequest::Pause { job, reply }))) => {
+                let allowed = lp.controller.world.jobs.get(job).is_some_and(|j| {
+                    matches!(
+                        j.phase,
+                        crate::core::world::JobPhase::Created
+                            | crate::core::world::JobPhase::Transferring
+                            | crate::core::world::JobPhase::Paused
+                    )
+                });
+                if allowed {
+                    let actions = lp
+                        .controller
+                        .handle(Observation::JobPaused { job }, Instant::now());
+                    route_actions(&mut lp, &actions);
+                    let _ = reply.send(Ok(()));
+                } else {
+                    let _ = reply.send(Err(Error::Config(
+                        "job cannot pause during preparation, probing, commit or teardown".into(),
+                    )));
+                }
+            }
+            Some(Input::Command(Ok(ControlRequest::Resume { job, reply }))) => {
+                let allowed = !shutdown
+                    && lp
+                        .controller
+                        .world
+                        .jobs
+                        .get(job)
+                        .is_some_and(|j| j.phase == crate::core::world::JobPhase::Paused);
+                if allowed {
+                    let actions = lp
+                        .controller
+                        .handle(Observation::JobResumed { job }, Instant::now());
+                    route_actions(&mut lp, &actions);
+                    let _ = reply.send(Ok(()));
+                } else {
+                    let _ = reply.send(Err(Error::Config("job is not paused".into())));
+                }
+            }
+            Some(Input::Command(Ok(ControlRequest::Submit(cmd)))) if !shutdown => {
+                admit_command(&mut lp, *cmd);
+            }
+            Some(Input::Command(Ok(ControlRequest::Submit(cmd)))) => {
+                let _ = cmd.admit_tx.send(Err(Error::EngineGone));
+                let _ = cmd.result_tx.send(Err(Error::EngineGone));
+            }
+            Some(Input::Command(Ok(ControlRequest::Shutdown) | Err(_))) => {
+                if !shutdown {
+                    shutdown = true;
+                    for job in lp.jobs.keys().copied().collect::<Vec<_>>() {
+                        let actions = lp
+                            .controller
+                            .handle(Observation::JobCancelled { job }, Instant::now());
+                        route_actions(&mut lp, &actions);
+                    }
+                }
+            }
+            Some(Input::Cancel(Ok((job, ack)))) => {
                 let actions = lp
                     .controller
                     .handle(Observation::JobCancelled { job }, Instant::now());
                 route_actions(&mut lp, &actions);
+                let _ = ack.send(());
             }
-            terminate = true;
-        }
-        // 1b. Cancellation requests become observations.
-        while let Ok(job) = cancel_rx.try_recv() {
-            tracing::info!(target: "xde::engine", ?job, "cancel requested");
-            if let Some(state) = lp.jobs.get(&job) {
-                state.context.cancel();
-            }
-            let actions = lp
-                .controller
-                .handle(Observation::JobCancelled { job }, Instant::now());
-            route_actions(&mut lp, &actions);
-        }
-
-        // 1c. Snapshot queries: bounded drain so a polling client cannot
-        // starve observations.
-        for _ in 0..16 {
-            let Ok(req) = lp.status_rx.try_recv() else {
-                break;
-            };
-            match req {
+            Some(Input::Status(Ok(request))) => match request {
                 StatusRequest::Job { job, reply } => {
                     let _ = reply.send(build_snapshot(&lp, job));
                 }
                 StatusRequest::Engine { reply } => {
                     let _ = reply.send(build_engine_snapshot(&lp));
                 }
-            }
-        }
-
-        // 2. Wait for the next observation or timer deadline.
-        let timeout = lp
-            .timers
-            .next_deadline()
-            .map(|d| d.saturating_duration_since(Instant::now()))
-            .unwrap_or(Duration::from_millis(50));
-        match obs_rx.recv_timeout(timeout.max(Duration::from_millis(1))) {
-            Ok(obs) => {
+            },
+            Some(Input::Observation(Ok(obs))) => {
+                let prepared_job = match &obs {
+                    Observation::DestinationPrepared { job, .. } => Some(*job),
+                    _ => None,
+                };
                 let progress_job = match &obs {
                     Observation::Probed { job, .. }
                     | Observation::AssignmentVerified { job, .. } => Some(*job),
@@ -365,13 +469,28 @@ fn run_loop(args: LoopArgs) {
                     publish_progress(&lp, job);
                 }
                 route_actions(&mut lp, &actions);
+                if let Some(job) = prepared_job
+                    && lp
+                        .controller
+                        .world
+                        .jobs
+                        .get(job)
+                        .is_some_and(|j| j.phase == crate::core::world::JobPhase::Created)
+                    && let Some((spec, resume)) = lp
+                        .jobs
+                        .get_mut(&job)
+                        .and_then(|state| state.admission.take())
+                {
+                    let actions = lp.controller.handle(
+                        Observation::JobAdmitted { job, spec, resume },
+                        Instant::now(),
+                    );
+                    route_actions(&mut lp, &actions);
+                }
             }
-            // Engine dropped: deterministic shutdown.
-            Err(flume::RecvTimeoutError::Disconnected) => break,
-            Err(flume::RecvTimeoutError::Timeout) => {}
+            Some(Input::Observation(Err(_))) => break,
+            Some(Input::Cancel(Err(_)) | Input::Status(Err(_))) | None => {}
         }
-
-        // 3. Expired timers become observations.
         for event in lp.timers.drain_expired(Instant::now()) {
             if let crate::core::timers::TimerEvent::CheckpointDue(job) = &event {
                 checkpoint_journal(&mut lp, *job);
@@ -381,24 +500,6 @@ fn run_loop(args: LoopArgs) {
                 .handle(Observation::TimerExpired { event }, Instant::now());
             route_actions(&mut lp, &actions);
         }
-
-        // 4. Both upstream mailboxes gone (engine dropped or shutdown
-        // requested and answered): exit. Any remaining job state is drained
-        // after the loop, which cancels contexts and answers every waiter
-        // explicitly rather than dropping the reply channel.
-        if terminate || (cmd_rx.is_disconnected() && obs_rx.is_disconnected()) {
-            break;
-        }
-    }
-
-    // Deterministic shutdown: fail every remaining waiter explicitly rather
-    // than dropping the reply channel (which would surface as EngineGone).
-    for (_, state) in lp.jobs.drain() {
-        state.context.cancel();
-        let _ = state
-            .result_tx
-            .send(Err(Error::Runtime(crate::core::RuntimeError::EngineGone)));
-        // Coordinator drops here: its own Drop releases the OS lock file.
     }
 
     save_profile(&profile_path, lp.controller.world.export_profiles());
@@ -430,6 +531,13 @@ fn save_profile(path: &Option<PathBuf>, profile: crate::core::profile::Persisted
 }
 
 fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
+    if cmd.final_path.is_none() && cmd.shared_destination.is_none() {
+        let _ = cmd
+            .admit_tx
+            .send(Err(Error::Config("job has no destination".into())));
+        return;
+    }
+
     // Open the file coordinator before admission so a bad path fails fast.
     let coordinator = cmd.final_path.as_ref().map(|path| {
         FileDestinationCoordinator::open_blocking(crate::storage::FileDestinationOptions::new(
@@ -448,7 +556,9 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
     };
 
     let spec = *cmd.spec;
-    if lp.controller.world.jobs.len() >= lp.controller.max_jobs() {
+    if lp.controller.world.jobs.len() >= lp.controller.max_jobs()
+        || lp.cleanup.len() >= lp.controller.max_jobs().saturating_mul(lp.shard_txs.len())
+    {
         let msg = "engine job limit reached".to_string();
         let _ = cmd.admit_tx.send(Err(Error::destination(msg.clone())));
         let _ = cmd.result_tx.send(Err(Error::destination(msg)));
@@ -512,11 +622,17 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
         job,
         JobState {
             result_tx: cmd.result_tx.clone(),
+            admission: None,
             context: JobContext::with_durability(spec.deadline, spec.persistence),
-            coordinator,
+            destination: coordinator.map(DestinationState::File).unwrap_or_else(|| {
+                DestinationState::Custom(
+                    cmd.shared_destination
+                        .clone()
+                        .expect("validated destination"),
+                )
+            }),
             part_path,
             journal,
-            shared: cmd.shared_destination.clone(),
             refresher: cmd.refresher,
             progress: cmd.progress,
             provenance: std::sync::Arc::new(std::sync::Mutex::new(
@@ -527,23 +643,26 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
     // Shared custom destination: register its capabilities so the
     // controller gates segmentation/parallelism honestly, and hand the
     // destination to the shard that will write it.
-    if let Some(dest) = &cmd.shared_destination {
-        if let Err(e) = lp.controller.world.set_sink_properties(
-            job,
-            crate::storage::DynDestination::caps(dest.as_ref()),
-            crate::storage::DynDestination::hints(dest.as_ref()),
-        ) {
-            let _ = cmd.admit_tx.send(Err(e));
-            return;
-        }
-        // Attach on every shard: connections (and their fetch tasks) may
-        // land on any of them.
-        for tx in &lp.shard_txs {
-            let _ = tx.try_send(ShardCommand::AttachDestination {
+    if let Some(dest) = &cmd.shared_destination
+        && let Err(error) = lp
+            .controller
+            .world
+            .set_sink_properties(job, dest.caps(), dest.hints())
+    {
+        let actions = lp.controller.handle(
+            Observation::DestinationFailed {
                 job,
-                dest: cmd.shared_destination.clone().unwrap(),
-            });
-        }
+                failure: crate::core::controller::DestinationFailure::from_error(&error),
+            },
+            Instant::now(),
+        );
+        route_actions(lp, &actions);
+        let _ = cmd.admit_tx.send(Err(error));
+        return;
+    }
+    if let Some(deadline) = spec.deadline {
+        lp.timers
+            .schedule(deadline, crate::core::timers::TimerEvent::JobDeadline(job));
     }
     let resumed = resume.as_ref().map_or(0, |r| r.durable.covered_len());
     let _ = cmd.admit_tx.send(Ok(job));
@@ -555,6 +674,16 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
             resumed_bytes: resumed,
         },
     );
+
+    if let Some(dest) = cmd.shared_destination {
+        lp.jobs.get_mut(&job).expect("admitted job").admission = Some((Box::new(spec), resume));
+        let actions = lp
+            .controller
+            .handle(Observation::DestinationPreparing { job }, Instant::now());
+        route_actions(lp, &actions);
+        send_shard(lp, 0, ShardCommand::PrepareDestination { job, dest });
+        return;
+    }
 
     let actions = lp.controller.handle(
         Observation::JobAdmitted {
@@ -643,8 +772,18 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
         tracing::trace!(target: "xde::engine", ?action, "control action");
         match action {
             Action::Resolve { origin, host, port } => {
-                lp.resolver
-                    .resolve(*origin, host.clone(), *port, lp.obs_tx.clone());
+                if !lp
+                    .resolver
+                    .resolve(*origin, host.clone(), *port, lp.obs_tx.clone())
+                {
+                    lp.pending.push_back(Observation::DispatchFailed {
+                        operation: crate::core::controller::DispatchOperation::Resolve,
+                        job: None,
+                        assignment: None,
+                        connection: None,
+                        origin: Some(*origin),
+                    });
+                }
             }
             Action::OpenConnection {
                 connection,
@@ -657,6 +796,16 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                 let Some(mut target) = build_target(lp, *origin, *endpoint) else {
                     continue;
                 };
+                if let Some(job) = lp
+                    .controller
+                    .world
+                    .connections
+                    .get(*connection)
+                    .and_then(|c| c.owner)
+                    .and_then(|job| lp.controller.world.jobs.get(job))
+                {
+                    target.http_version = job.policy.http_version;
+                }
                 if let Some(port) = alt_port {
                     target.addr.set_port(*port);
                 }
@@ -748,6 +897,14 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                     lp,
                     shard_of_connection(lp, *connection),
                     ShardCommand::StartRange {
+                        control: lp.controller.world.jobs[*job]
+                            .plan
+                            .as_ref()
+                            .unwrap()
+                            .assignment(assignment.assignment)
+                            .unwrap()
+                            .control
+                            .clone(),
                         job: *job,
                         assignment: *assignment,
                         attempt,
@@ -771,6 +928,10 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                                 deadline: None,
                             })
                         }),
+                        destination: match &state.destination {
+                            DestinationState::Custom(dest) => Some(dest.clone()),
+                            _ => None,
+                        },
                         part_path: state.part_path.clone(),
                         context: state.context.clone(),
                         rep_lock: lock,
@@ -802,6 +963,14 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                     lp,
                     shard_of_connection(lp, *connection),
                     ShardCommand::StartFullBody {
+                        control: lp.controller.world.jobs[*job]
+                            .plan
+                            .as_ref()
+                            .unwrap()
+                            .assignment(assignment.assignment)
+                            .unwrap()
+                            .control
+                            .clone(),
                         job: *job,
                         attempt: 0,
                         assignment: *assignment,
@@ -816,6 +985,10 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                                 deadline: None,
                             })
                         }),
+                        destination: match &state.destination {
+                            DestinationState::Custom(dest) => Some(dest.clone()),
+                            _ => None,
+                        },
                         part_path: state.part_path.clone(),
                         context: state.context.clone(),
                         source_id: source,
@@ -891,13 +1064,17 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
             }
             Action::CloseConnection { connection } => {
                 tracing::info!(target: "xde::engine", ?connection, "close connection");
-                // The world model already removed the node; find which shard
-                // owned it from the pre-removal record kept by the caller of
-                // remove_connection. We broadcast close; shards ignore
-                // unknown ids.
-                for tx in &lp.shard_txs {
-                    let _ = tx.try_send(ShardCommand::CloseConnection {
-                        connection: *connection,
+                if let Some(shard) = lp.controller.connection_shard(*connection)
+                    && matches!(
+                        lp.shard_txs[shard].try_send(ShardCommand::CloseConnection {
+                            connection: *connection
+                        }),
+                        Err(TrySendError::Full(_))
+                    )
+                {
+                    lp.cleanup.push_back(Cleanup {
+                        shard,
+                        command: CleanupCommand::Close(*connection),
                     });
                 }
             }
@@ -909,61 +1086,36 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                 let Some(state) = lp.jobs.get_mut(job) else {
                     continue;
                 };
-                // Shared custom destination: finalize on the shard that
-                // holds it (flush → read-back digest → commit).
-                if state.shared.is_some() {
-                    let (ack_tx, ack_rx) = flume::bounded(1);
-                    send_shard(
-                        lp,
-                        0,
-                        ShardCommand::CommitSharedDestination {
-                            job: *job,
-                            final_length: *final_length,
-                            integrity: *integrity,
-                            ack: ack_tx,
-                        },
-                    );
-                    // Bounded wait: commit is the job's terminal step and
-                    // every downstream path (outcome reply, journal cleanup)
-                    // needs the digest verdict.
-                    let result = ack_rx.recv_timeout(Duration::from_secs(30));
-                    let obs = match result {
-                        Ok(Ok(digest)) => Observation::DestinationCommitted {
-                            job: *job,
-                            final_length: *final_length,
-                            digest,
-                        },
-                        Ok(Err(e)) => Observation::DestinationFailed {
-                            job: *job,
-                            failure: crate::core::controller::DestinationFailure::from_error(&e),
-                        },
-                        Err(_) => Observation::DestinationFailed {
+                let durability = state.context.durability();
+                let destination =
+                    std::mem::replace(&mut state.destination, DestinationState::Committing);
+                let coordinator = match destination {
+                    DestinationState::Custom(dest) => {
+                        send_shard(
+                            lp,
+                            0,
+                            ShardCommand::CommitSharedDestination {
+                                dest,
+                                job: *job,
+                                final_length: *final_length,
+                                integrity: *integrity,
+                            },
+                        );
+                        continue;
+                    }
+                    DestinationState::File(coordinator) => coordinator,
+                    DestinationState::Committing => {
+                        lp.pending.push_back(Observation::DestinationFailed {
                             job: *job,
                             failure: crate::core::controller::DestinationFailure {
-                                kind:
-                                    crate::core::controller::DestinationFailureKind::DestinationError,
+                                kind: crate::core::controller::DestinationFailureKind::DestinationError,
                             },
-                        },
-                    };
-                    let _ = lp.obs_tx.send(obs);
-                    continue;
-                }
-                let durability = state.context.durability();
-                let Some(coordinator) = state.coordinator.take() else {
-                    // Non-file destination: nothing to finalize.
-                    let _ = lp.obs_tx.send(Observation::DestinationCommitted {
-                        job: *job,
-                        final_length: *final_length,
-                        digest: None,
-                    });
-                    continue;
+                        });
+                        continue;
+                    }
                 };
-                // Every shard that opened a lane against the `.part` must
-                // drop its handle before the rename; a Windows rename with
-                // any writer open fails outright.
                 let part_path = state.part_path.clone();
-                close_lanes_everywhere(lp, &part_path);
-                // The finalize itself runs on shard 0.
+                let lanes_closed = close_lanes_everywhere(lp, &part_path);
                 send_shard(
                     lp,
                     0,
@@ -974,21 +1126,32 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                         final_length: *final_length,
                         integrity: *integrity,
                         durability,
+                        lanes_closed,
                     },
                 );
             }
-            Action::DiscardDestination { job } => {
-                if let Some(state) = lp.jobs.remove(job) {
+            Action::CancelTransfer { job } => {
+                if let Some(state) = lp.jobs.get(job) {
                     state.context.cancel();
-                    // Coordinator drops: lock file released, `.part` left for
-                    // a future resume decision.
+                }
+            }
+            Action::ResetTransfer { job } => {
+                if let Some(state) = lp.jobs.get_mut(job) {
+                    state.context = JobContext::with_durability(
+                        state.context.deadline(),
+                        state.context.durability(),
+                    );
+                    *state.provenance.lock().expect("provenance lock") =
+                        crate::core::ArtifactProvenance::new();
                 }
             }
             Action::FailJob { job, error } => {
-                let err = match error.as_str() {
-                    crate::core::controller::CANCELLED_SENTINEL => Error::Cancelled,
-                    crate::core::controller::DEADLINE_SENTINEL => Error::DeadlineExceeded,
-                    _ => Error::destination(error.clone()),
+                let err = match error {
+                    crate::core::world::JobFailure::Cancelled => Error::Cancelled,
+                    crate::core::world::JobFailure::DeadlineExceeded => Error::DeadlineExceeded,
+                    crate::core::world::JobFailure::Failed(message) => {
+                        Error::destination(message.clone())
+                    }
                 };
                 finish_job(lp, *job, Err(err));
             }
@@ -1086,24 +1249,90 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
     }
 }
 
-fn send_shard(lp: &Loop, shard: usize, cmd: ShardCommand) {
-    let Some(tx) = lp.shard_txs.get(shard) else {
-        return;
+fn send_shard(lp: &mut Loop, shard: usize, cmd: ShardCommand) {
+    use crate::core::controller::{
+        DestinationFailure, DestinationFailureKind, DispatchOperation as Op,
     };
-    if let Err(e) = tx.try_send(cmd) {
-        let is_full = matches!(e, flume::TrySendError::Full(_));
-        let _ = lp.obs_tx.send(Observation::DispatchFailed {
-            operation: if is_full {
-                crate::core::controller::DispatchOperation::StartAssignment
-            } else {
-                crate::core::controller::DispatchOperation::CloseConnection
-            },
-            job: None,
-            assignment: None,
-            connection: None,
-            origin: None,
-        });
+    let (operation, job, assignment, connection) = match &cmd {
+        ShardCommand::OpenConnection { connection, .. } => {
+            (Op::OpenConnection, None, None, Some(*connection))
+        }
+        ShardCommand::Probe {
+            job, connection, ..
+        } => (Op::Probe, Some(*job), None, Some(*connection)),
+        ShardCommand::StartRange {
+            job,
+            assignment,
+            connection,
+            ..
+        } => (
+            Op::StartAssignment,
+            Some(*job),
+            Some(*assignment),
+            Some(*connection),
+        ),
+        ShardCommand::StartFullBody {
+            job,
+            assignment,
+            connection,
+            ..
+        } => (
+            Op::StartFullBody,
+            Some(*job),
+            Some(*assignment),
+            Some(*connection),
+        ),
+        ShardCommand::TruncateAssignment {
+            job,
+            assignment,
+            connection,
+            ..
+        } => (
+            Op::TruncateAssignment,
+            Some(*job),
+            Some(*assignment),
+            Some(*connection),
+        ),
+        ShardCommand::SampleMirror {
+            job, connection, ..
+        } => (Op::SampleMirror, Some(*job), None, Some(*connection)),
+        ShardCommand::CommitDestination { job, .. }
+        | ShardCommand::CommitSharedDestination { job, .. } => {
+            (Op::CommitDestination, Some(*job), None, None)
+        }
+        ShardCommand::PrepareDestination { job, .. } => {
+            (Op::PrepareDestination, Some(*job), None, None)
+        }
+        ShardCommand::CloseConnection { connection } => {
+            (Op::CloseConnection, None, None, Some(*connection))
+        }
+        ShardCommand::ReleaseJob { job, .. } => (Op::CloseLane, Some(*job), None, None),
+        ShardCommand::CloseLane { .. } => (Op::CloseLane, None, None, None),
+    };
+    let failed = lp
+        .shard_txs
+        .get(shard)
+        .is_none_or(|tx| tx.try_send(cmd).is_err());
+    if !failed {
+        return;
     }
+    let observation = if operation == Op::CommitDestination {
+        Observation::DestinationFailed {
+            job: job.expect("commit belongs to a job"),
+            failure: DestinationFailure {
+                kind: DestinationFailureKind::DestinationError,
+            },
+        }
+    } else {
+        Observation::DispatchFailed {
+            operation,
+            job,
+            assignment,
+            connection,
+            origin: None,
+        }
+    };
+    lp.pending.push_back(observation);
 }
 
 /// Publish telemetry for an observation. Events are derived from real runtime
@@ -1119,15 +1348,7 @@ fn emit_observation_events(lp: &Loop, obs: &Observation) {
             let Some(c) = lp.controller.world.connections.get(*connection) else {
                 return;
             };
-            // Attribute the connection to whichever job is waiting to probe
-            // or transfer on its origin; connections are engine-owned pools.
-            let job = lp
-                .controller
-                .world
-                .jobs
-                .iter()
-                .find(|(_, j)| j.origin == c.origin)
-                .map(|(id, _)| id);
+            let job = c.owner;
             if let Some(job) = job {
                 emit(
                     lp,
@@ -1173,7 +1394,11 @@ fn emit_observation_events(lp: &Loop, obs: &Observation) {
             );
         }
         Observation::AssignmentVerified {
-            job, range, sample, ..
+            job,
+            connection,
+            range,
+            sample,
+            ..
         } => {
             // Telemetry carries the *receive* rate: pure network evidence,
             // never polluted by destination or memory stalls.
@@ -1181,25 +1406,9 @@ fn emit_observation_events(lp: &Loop, obs: &Observation) {
                 lp,
                 Event::WorkerFinished {
                     job: *job,
+                    connection: *connection,
                     range: *range,
-                    rate: crate::core::units::Rate::from_bps(sample.receive_rate()),
-                    receive_active: sample.receive_active,
-                    destination_blocked: sample.destination_blocked,
-                    next_pending: sample.next_pending,
-                    max_frame_gap: sample.max_frame_gap,
-                    send_ready: sample.send_ready,
-                    headers: sample.headers,
-                    data_frames: sample.data_frames,
-                    dest_accepts: sample.dest_accepts,
-                    copy_count: sample.copy_count,
-                    copied_bytes: sample.copied_bytes,
-                    avg_frame: sample.avg_frame,
-                    frame_p50: sample.frame_p50,
-                    frame_p90: sample.frame_p90,
-                    io_reads_submitted: sample.io_reads_submitted,
-                    io_reads_completed: sample.io_reads_completed,
-                    zero_read: sample.zero_read,
-                    max_zero_read: sample.max_zero_read,
+                    sample: sample.clone(),
                 },
             );
         }
@@ -1214,16 +1423,15 @@ fn build_engine_snapshot(lp: &Loop) -> crate::snapshot::EngineSnapshot {
     let mut active_jobs = 0usize;
     let mut active_streams = 0usize;
     for (_, j) in lp.controller.world.jobs.iter() {
-        if !j.phase.is_terminal() && j.phase != crate::core::world::JobPhase::Cancelling {
+        if j.activated && !j.phase.is_draining() && j.phase != crate::core::world::JobPhase::Paused
+        {
             active_jobs += 1;
         }
         active_streams += j.plan.as_ref().map_or(0, |p| p.in_flight());
     }
-    let mut physical_connections = 0usize;
     let mut protocol_counts: std::collections::BTreeMap<String, usize> = Default::default();
     let mut origins: Vec<crate::core::ids::OriginId> = Vec::new();
     for (_, c) in lp.controller.world.connections.iter() {
-        physical_connections += 1;
         *protocol_counts
             .entry(format!("{:?}", c.protocol))
             .or_insert(0) += 1;
@@ -1244,8 +1452,24 @@ fn build_engine_snapshot(lp: &Loop) -> crate::snapshot::EngineSnapshot {
         })
         .collect();
     crate::snapshot::EngineSnapshot {
+        controller: lp.controller.stats,
+        queued_jobs: lp
+            .controller
+            .world
+            .jobs
+            .values()
+            .filter(|j| {
+                !j.activated
+                    && matches!(
+                        j.phase,
+                        crate::core::world::JobPhase::Created
+                            | crate::core::world::JobPhase::Probing
+                            | crate::core::world::JobPhase::Transferring
+                    )
+            })
+            .count(),
         active_jobs,
-        physical_connections,
+        physical_connections: lp.controller.reserved_connections(),
         active_streams,
         protocol_counts,
         active_origins: origins.len(),
@@ -1256,11 +1480,11 @@ fn build_engine_snapshot(lp: &Loop) -> crate::snapshot::EngineSnapshot {
 
 fn build_snapshot(lp: &Loop, job: JobId) -> Option<crate::snapshot::JobSnapshot> {
     let j = lp.controller.world.jobs.get(job)?;
-    // Live connections for this origin (job shares engine-owned pools).
+    // Only connections currently owned by this job enter its projection.
     let mut active_connections = 0usize;
     let mut protocols = Vec::new();
     for (_, c) in lp.controller.world.connections.iter() {
-        if c.origin == j.origin && c.status == ConnectionStatus::Ready {
+        if c.owner == Some(job) && c.status == ConnectionStatus::Ready {
             active_connections += 1;
             if !protocols.contains(&c.protocol) {
                 protocols.push(c.protocol);
@@ -1272,7 +1496,31 @@ fn build_snapshot(lp: &Loop, job: JobId) -> Option<crate::snapshot::JobSnapshot>
         stats.is_warm().then(|| stats.mean())
     });
     Some(crate::snapshot::JobSnapshot {
-        phase: j.phase.into(),
+        desired: j.planner.desired(),
+        granted: j.grant,
+        queued: !j.activated
+            && matches!(
+                j.phase,
+                crate::core::world::JobPhase::Created
+                    | crate::core::world::JobPhase::Probing
+                    | crate::core::world::JobPhase::Transferring
+            ),
+        globally_constrained: lp.controller.globally_constrained(job),
+        opening_connections: lp
+            .controller
+            .world
+            .connections
+            .values()
+            .filter(|c| c.owner == Some(job) && c.status == ConnectionStatus::Connecting)
+            .count(),
+        consumed_bytes: j.useful_bytes.saturating_add(
+            j.plan
+                .iter()
+                .flat_map(|p| p.iter_assignments())
+                .map(|(_, a)| a.control.bytes())
+                .sum::<u64>(),
+        ),
+        phase: (&j.phase).into(),
         total_length: j.total_length,
         verified_bytes: j.plan.as_ref().map_or(0, |p| p.bytes_done()),
         resumed_bytes: j.resumed_bytes,
@@ -1335,7 +1583,22 @@ fn record_progress(lp: &mut Loop, obs: &Observation) {
             journal.payload_mut().total = *total_length;
             journal.payload_mut().fingerprint.content_length = *total_length;
         }
-        Observation::AssignmentVerified { job, range, .. } => {
+        Observation::AssignmentVerified {
+            job,
+            assignment,
+            range,
+            ..
+        } => {
+            if !lp.controller.has_assignment(*assignment)
+                || lp
+                    .controller
+                    .world
+                    .jobs
+                    .get(*job)
+                    .is_none_or(|j| j.phase.is_draining())
+            {
+                return;
+            }
             let durability = match lp.controller.world.jobs.get(*job) {
                 Some(j) => j.durability,
                 None => return,
@@ -1428,30 +1691,18 @@ fn sync_fingerprint(node: Option<&crate::core::world::JobNode>, journal: &mut Jo
     }
 }
 
-/// Broadcast a lane close to every shard and wait for all acknowledgements.
-/// Bounded: a misbehaving shard delays the commit by at most `timeout`.
-fn close_lanes_everywhere(lp: &Loop, part_path: &std::path::Path) {
-    let timeout = Duration::from_secs(5);
-    let (ack_tx, ack_rx) = flume::bounded(lp.shard_txs.len());
-    for tx in &lp.shard_txs {
-        let _ = tx.try_send(ShardCommand::CloseLane {
-            part_path: part_path.to_path_buf(),
-            ack: ack_tx.clone(),
-        });
-    }
-    drop(ack_tx);
-    let mut remaining = lp.shard_txs.len();
-    let deadline = Instant::now() + timeout;
-    while remaining > 0 {
-        let now = Instant::now();
-        if now >= deadline {
-            return;
-        }
-        match ack_rx.recv_timeout(deadline - now) {
-            Ok(()) => remaining -= 1,
-            Err(flume::RecvTimeoutError::Timeout | flume::RecvTimeoutError::Disconnected) => return,
-        }
-    }
+fn close_lanes_everywhere(lp: &Loop, part_path: &std::path::Path) -> Vec<Receiver<()>> {
+    lp.shard_txs
+        .iter()
+        .map(|tx| {
+            let (ack, done) = flume::bounded(1);
+            let _ = tx.try_send(ShardCommand::CloseLane {
+                part_path: part_path.to_path_buf(),
+                ack,
+            });
+            done
+        })
+        .collect()
 }
 
 fn shard_of_connection(lp: &Loop, conn: ConnectionId) -> usize {
@@ -1473,6 +1724,7 @@ fn build_target(
     let e = lp.controller.world.endpoints.get(endpoint)?;
     let key = &o.key;
     Some(ConnectTarget {
+        http_version: crate::HttpVersionPolicy::Auto,
         key: key.clone(),
         addr: e.address,
         sni: key.host.to_string(),
@@ -1558,6 +1810,23 @@ fn finish_job(lp: &mut Loop, job: JobId, outcome: Result<JobOutcome>) {
         checkpoint_journal(lp, job);
     }
     if let Some(state) = lp.jobs.remove(&job) {
+        for (shard, tx) in lp.shard_txs.iter().enumerate() {
+            if matches!(
+                tx.try_send(ShardCommand::ReleaseJob {
+                    job,
+                    part_path: state.part_path.clone()
+                }),
+                Err(TrySendError::Full(_))
+            ) {
+                lp.cleanup.push_back(Cleanup {
+                    shard,
+                    command: CleanupCommand::Release {
+                        job,
+                        part_path: state.part_path.clone(),
+                    },
+                });
+            }
+        }
         use crate::core::events::Event;
         match &outcome {
             Ok(o) => emit(

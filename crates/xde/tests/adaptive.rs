@@ -29,18 +29,22 @@ fn auto_does_not_explode_cold_start_requests() {
     server.shutdown();
 }
 
-#[test]
-fn capped_origin_uses_more_than_one_connection_when_allowed() {
+#[rstest::rstest]
+#[case(64, 2)]
+#[case(128, 8)]
+fn capped_origin_uses_more_than_one_connection_when_allowed(
+    #[case] size_mib: u64,
+    #[case] cap_mib_s: u64,
+) {
     let spec = FixtureSpec {
-        per_connection_bps: Some(2 * 1024 * 1024),
-        size: 2 * 1024 * 1024,
+        per_connection_bps: Some(cap_mib_s * 1024 * 1024),
+        size: size_mib * 1024 * 1024,
         ..FixtureSpec::default()
     };
     let server = spawn_h1(spec.clone());
     let env = DownloadEnv::new();
     let engine = test_engine();
     let policy = TransferPolicy {
-        initial_physical_connections: 1,
         transport: TransportLimits {
             max_physical_connections: 4,
             max_active_assignments: 8,
@@ -55,29 +59,22 @@ fn capped_origin_uses_more_than_one_connection_when_allowed() {
         .policy(policy)
         .start()
         .unwrap();
-    let watcher = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
-        while std::time::Instant::now() < deadline {
-            match events.try_recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(Event::ConcurrencyChanged { connections, .. }) if connections >= 2 => {
-                    return true;
-                }
-                Ok(_) => {}
-                Err(_) => {}
-            }
-        }
-        false
-    });
     let outcome = wait_job(job).unwrap();
-    let saw_scale = watcher.join().unwrap();
     assert_eq!(outcome.bytes, spec.size);
     assert_bytes_match(&env.path, spec.size);
-    let spread = server.stats.conn_bytes();
-    let workers = spread.iter().filter(|b| **b > 0).count();
+    let mut payload_connections = std::collections::HashSet::new();
+    while let Ok(event) = events.try_recv_timeout(std::time::Duration::ZERO) {
+        if let Event::WorkerFinished {
+            connection, sample, ..
+        } = event
+            && sample.bytes > 0
+        {
+            payload_connections.insert(connection);
+        }
+    }
     assert!(
-        saw_scale || workers >= 2 || server.stats.accepts() >= 2,
-        "cap should induce scale-out: accepts={} spread={spread:?} saw_scale={saw_scale}",
-        server.stats.accepts()
+        payload_connections.len() >= 2,
+        "bandwidth cap should induce useful scale-out, payload connections={payload_connections:?}"
     );
     engine.shutdown().ok();
     server.shutdown();
@@ -94,6 +91,7 @@ fn engine_assignment_ceiling_is_respected() {
         max_connections_per_origin: 2,
         max_jobs: 8,
         memory_bytes: 16 * 1024 * 1024,
+        ..Default::default()
     });
     let job = engine.download(server.url()).to(&env.path).start().unwrap();
     let outcome = wait_job(job).unwrap();
