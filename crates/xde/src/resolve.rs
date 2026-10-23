@@ -37,29 +37,31 @@ struct Request {
     reply: Sender<Observation>,
 }
 
-pub(crate) fn spawn() -> ResolverHandle {
+pub(crate) fn spawn() -> (ResolverHandle, thread::JoinHandle<()>) {
     let (tx, rx) = flume::bounded::<Request>(256);
-    thread::Builder::new()
+    let join = thread::Builder::new()
         .name("xde-resolver".into())
         .spawn(move || run(rx))
         .expect("resolver thread spawn");
-    ResolverHandle { tx }
+    (ResolverHandle { tx }, join)
 }
 
 impl ResolverHandle {
-    pub fn resolve(&self, origin: OriginId, host: String, port: u16, reply: Sender<Observation>) {
-        let _ = self.tx.try_send(Request {
-            origin,
-            host,
-            port,
-            reply,
-        });
-    }
-}
-
-impl ResolverHandle {
-    pub(crate) fn spawn() -> Self {
-        spawn()
+    pub fn resolve(
+        &self,
+        origin: OriginId,
+        host: String,
+        port: u16,
+        reply: Sender<Observation>,
+    ) -> bool {
+        self.tx
+            .try_send(Request {
+                origin,
+                host,
+                port,
+                reply,
+            })
+            .is_ok()
     }
 }
 
@@ -118,18 +120,20 @@ fn run(rx: flume::Receiver<Request>) {
     // because we are calling it from within the run_until future itself,
     // so the LocalSet is not moved.
     rt.block_on(local.run_until(async move {
-        let resolver = resolver;
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
             let req = match rx.recv_async().await {
                 Ok(r) => r,
                 Err(_) => break,
             };
             let resolver = resolver.clone();
-            tokio::task::spawn_local(async move {
+            tasks.spawn_local(async move {
                 let answer = resolve_host(&resolver, &req.host, req.port).await;
                 send_resolved(req.origin, answer.addrs, answer.https_records, req.reply);
             });
+            while tasks.try_join_next().is_some() {}
         }
+        tasks.shutdown().await;
     }));
 }
 

@@ -9,10 +9,9 @@ use crate::core::{
     ids::TransportOriginKey,
 };
 use compio::net::TcpStream;
-use compio::tls::TlsStream;
 use hyper::client::conn::{http1, http2};
 
-use crate::net::{h2::H2Handle, hyper_io::CompioIo, tcp::TcpTuning, tls::TlsSetup};
+use crate::net::{exec::CompioExec, hyper_io::CompioIo, tcp::TcpTuning, tls::TlsSetup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WireProtocol {
@@ -33,6 +32,7 @@ impl From<WireProtocol> for Protocol {
 
 #[derive(Debug, Clone)]
 pub struct ConnectTarget {
+    pub http_version: crate::HttpVersionPolicy,
     pub key: TransportOriginKey,
     pub addr: SocketAddr,
     pub sni: String,
@@ -46,8 +46,8 @@ pub struct ConnectorConfig {
     pub h2_initial_stream_window: u32,
     pub h2_initial_conn_window: u32,
     pub h2_adaptive_window: bool,
-    /// HTTP/2 max frame size advertised to the peer. Larger frames reduce
-    /// per-frame processing overhead on high-throughput streams.
+    /// HTTP/2 DATA frames are buffered before delivery. Bound frame size
+    /// independently of the larger flow-control windows.
     pub h2_max_frame_size: u32,
     pub h1_read_buf: usize,
     pub h2_read_buf: usize,
@@ -66,19 +66,15 @@ impl Default for ConnectorConfig {
         Self {
             tcp: TcpTuning::default(),
             connect_timeout: Duration::from_secs(15),
-            // Large windows on purpose: the default 64KB stream window caps a
-            // single H2 stream at roughly (window / RTT), which on a 100ms path
-            // is about 5Mbps. That single default is why "H2 is slow for
-            // downloads" is folklore. 64 MiB windows were tried against the
-            // H2 1c1s stall and made median throughput worse; 8/32 MiB is
-            // enough for loopback 1 MiB frames without holding extra credit.
+            // Flow-control credit permits high-BDP paths without requiring
+            // equally large delivery units.
             h2_initial_stream_window: 8 * 1024 * 1024,
             h2_initial_conn_window: 32 * 1024 * 1024,
             // hyper's adaptive_window(true) resets both windows to 64 KiB.
             h2_adaptive_window: false,
-            h2_max_frame_size: 1024 * 1024, // 1 MiB - fewer DATA frames
+            h2_max_frame_size: 64 * 1024,
             h1_read_buf: 256 * 1024,
-            h2_read_buf: 1024 * 1024,
+            h2_read_buf: 256 * 1024,
             h1_writev: true,
             force_http1: false,
             prior_knowledge_http2: false,
@@ -97,6 +93,7 @@ pub enum PhysicalConnection {
     Http3 {
         sender: crate::net::h3::H3SendRequest,
         conn: compio_quic::Connection,
+        driver: compio::runtime::JoinHandle<()>,
     },
     Http1 {
         sender: Option<http1::SendRequest<crate::net::body::EngineBody>>,
@@ -104,7 +101,7 @@ pub enum PhysicalConnection {
     },
     Http2 {
         sender: http2::SendRequest<crate::net::body::EngineBody>,
-        handle: H2Handle,
+        driver: compio::runtime::JoinHandle<()>,
     },
 }
 
@@ -195,35 +192,15 @@ impl PhysicalConnection {
                 let driver = std::mem::replace(driver, compio::runtime::spawn(async {}));
                 let _ = driver.cancel().await;
             }
-            PhysicalConnection::Http2 { sender, handle } => {
-                let _ = sender;
-                handle.shutdown();
-                let handle = handle.clone();
-                std::future::poll_fn(move |cx| handle.poll_task(cx)).await;
+            PhysicalConnection::Http2 { driver, .. } => {
+                let driver = std::mem::replace(driver, compio::runtime::spawn(async {}));
+                let _ = driver.cancel().await;
             }
-            PhysicalConnection::Http3 { conn, .. } => {
+            PhysicalConnection::Http3 { conn, driver, .. } => {
                 conn.close(0u32.into(), b"retired");
+                let driver = std::mem::replace(driver, compio::runtime::spawn(async {}));
+                let _ = driver.cancel().await;
             }
-        }
-    }
-
-    /// Clone the cooperative H2 task handle, if this is an H2 connection.
-    pub fn h2_handle(&self) -> Option<crate::net::h2::H2Handle> {
-        match self {
-            PhysicalConnection::Http2 { handle, .. } => Some(handle.clone()),
-            _ => None,
-        }
-    }
-
-    /// Admit a stream future onto this physical H2 connection's cooperative
-    /// task. Returns `false` for H1/H3 so the caller can spawn instead.
-    pub fn admit_h2_stream(&self, fut: impl std::future::Future<Output = ()> + 'static) -> bool {
-        match self.h2_handle() {
-            Some(handle) => {
-                handle.admit(fut);
-                true
-            }
-            None => false,
         }
     }
 }
@@ -298,10 +275,14 @@ impl Connector {
                 "h3 client TLS configuration unavailable".into(),
             )));
         };
-        let (sender, conn) =
+        let (sender, conn, driver) =
             crate::net::h3::open_h3(endpoint, target.addr, &target.sni, Some(cfg)).await?;
         Ok((
-            PhysicalConnection::Http3 { sender, conn },
+            PhysicalConnection::Http3 {
+                sender,
+                conn,
+                driver,
+            },
             ConnectMetrics {
                 tcp_handshake: t0.elapsed(),
                 tls_handshake: Duration::ZERO,
@@ -327,14 +308,19 @@ impl Connector {
         let tcp_handshake = t0.elapsed();
         crate::net::tcp::apply_tuning(&tcp, &self.cfg.tcp);
 
+        let force_http1 =
+            self.cfg.force_http1 || target.http_version == crate::HttpVersionPolicy::Http1Only;
+        let prior_h2 = !force_http1
+            && (self.cfg.prior_knowledge_http2
+                || target.http_version == crate::HttpVersionPolicy::Http2PriorKnowledge);
         if !target.tls {
-            let read_buf = if self.cfg.prior_knowledge_http2 {
+            let read_buf = if prior_h2 {
                 self.cfg.h2_read_buf
             } else {
                 self.cfg.h1_read_buf
             };
             let io = CompioIo::from_split(tcp, read_buf);
-            let (conn, protocol) = if self.cfg.prior_knowledge_http2 {
+            let (conn, protocol) = if prior_h2 {
                 (self.handshake_h2(io).await?, WireProtocol::Http2)
             } else {
                 (self.handshake_h1(io).await?, WireProtocol::Http1)
@@ -350,14 +336,20 @@ impl Connector {
         }
 
         let t1 = Instant::now();
-        let setup = if self.cfg.force_http1 {
+        let setup = if force_http1 {
             &self.tls_h1_only
         } else {
             &self.tls
         };
-        let tls_stream: TlsStream<TcpStream> = setup
+        let tls_stream = setup
             .connector()
-            .connect(&target.sni, tcp)
+            .connect(
+                &target.sni,
+                Box::pin(compio_io::compat::AsyncStream::with_capacity(
+                    self.cfg.h1_read_buf,
+                    tcp,
+                )),
+            )
             .await
             .map_err(|e| Error::Transport(crate::core::error::TransportError::Io(e)))?;
         let tls_handshake = t1.elapsed();
@@ -367,7 +359,7 @@ impl Connector {
             .is_some_and(|p| p.as_ref() == b"h2");
 
         let io = CompioIo::new(tls_stream);
-        let (conn, protocol) = if alpn_h2 && !self.cfg.force_http1 {
+        let (conn, protocol) = if alpn_h2 && !force_http1 {
             (self.handshake_h2(io).await?, WireProtocol::Http2)
         } else {
             (self.handshake_h1(io).await?, WireProtocol::Http1)
@@ -418,8 +410,7 @@ impl Connector {
         // Window setters disable adaptive flow control. Calling
         // adaptive_window(true) afterwards would throw away the 8/32 MiB
         // windows and pin the stream at the spec 64 KiB default.
-        let handle = H2Handle::new();
-        let mut builder = http2::Builder::new(handle.executor());
+        let mut builder = http2::Builder::new(CompioExec);
         builder.keep_alive_interval(None);
         builder.max_frame_size(self.cfg.h2_max_frame_size);
         if self.cfg.h2_adaptive_window {
@@ -434,9 +425,9 @@ impl Connector {
             .await
             .map_err(|e| Error::protocol(format!("h2 handshake: {e}")))?;
 
-        handle.set_dispatcher(async move {
+        let driver = compio::runtime::spawn(async move {
             let _ = conn.await;
         });
-        Ok(PhysicalConnection::Http2 { sender, handle })
+        Ok(PhysicalConnection::Http2 { sender, driver })
     }
 }

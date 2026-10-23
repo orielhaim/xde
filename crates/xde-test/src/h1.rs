@@ -139,7 +139,7 @@ fn serve_conn(
             break;
         }
 
-        let range = parse_range(&head, spec.size);
+        let range = parse_range(&head, spec.size).filter(|_| spec.ranges.honors(nth));
         let (start, end_incl) = range.unwrap_or((0, spec.size.saturating_sub(1)));
         let len = end_incl.saturating_sub(start).saturating_add(1);
         let alt = spec
@@ -176,17 +176,7 @@ fn serve_conn(
                 .min(end_incl);
         }
 
-        if write_body(
-            &mut stream,
-            start,
-            send_end,
-            spec.per_connection_bps,
-            spec.corrupt_from,
-            &stats,
-            &stop,
-        )
-        .is_err()
-        {
+        if write_body(&mut stream, start, send_end, &spec, &stats, &stop).is_err() {
             break;
         }
         conn_bytes += send_end.saturating_sub(start).saturating_add(1);
@@ -206,8 +196,7 @@ fn write_body(
     stream: &mut TcpStream,
     start: u64,
     end_incl: u64,
-    bps: Option<u64>,
-    corrupt_from: Option<u64>,
+    spec: &FixtureSpec,
     stats: &FixtureStats,
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
@@ -215,21 +204,34 @@ fn write_body(
         return Ok(());
     }
     let block = payload::tile_ref();
+    let mut egress = spec.egress.as_ref().map(|budget| budget.session());
     let mut offset = start;
     let origin = Instant::now();
     let mut sent_on_conn = 0u64;
     while offset <= end_incl && !stop.load(Ordering::Acquire) {
         let in_block = (offset % block.len() as u64) as usize;
         let remaining = (end_incl - offset + 1) as usize;
-        let take = remaining.min(block.len() - in_block);
-        if let Some(limit) = bps {
+        let take = remaining
+            .min(block.len() - in_block)
+            .min(if egress.is_some() {
+                64 * 1024
+            } else {
+                usize::MAX
+            });
+        if let Some(egress) = &mut egress {
+            let wait = egress.delay(take, remaining);
+            if !wait.is_zero() {
+                thread::sleep(wait);
+            }
+        }
+        if let Some(limit) = spec.per_connection_bps {
             let due = Duration::from_secs_f64((sent_on_conn + take as u64) as f64 / limit as f64);
             let wait = due.saturating_sub(origin.elapsed());
             if !wait.is_zero() {
                 thread::sleep(wait);
             }
         }
-        if let Some(from) = corrupt_from {
+        if let Some(from) = spec.corrupt_from {
             let mut scratch = block[in_block..in_block + take].to_vec();
             for (i, b) in scratch.iter_mut().enumerate() {
                 if offset + i as u64 >= from {

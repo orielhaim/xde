@@ -1,119 +1,104 @@
-# XDE Benchmarks
+# Performance measurement
 
-Loopback benchmarks for XDE against curl.
+Use the current local source, locked dependencies and release binaries. The
+[scheduler report](docs/scheduling-results.md) identifies measured builds and
+retains complete raw cohorts. The [scheduler runner](benchmarks/2026-10-20-scheduler/README.md)
+reproduces alternating comparisons without an environmental CPU rejection gate.
+The [PR #1 investigation](docs/pr1-performance.md) records control-plane scaling,
+effective capacity/range corrections, matched regression pilots, H3 sender CPU
+attribution and controlled packet-delay measurements. Its [raw evidence](benchmarks/2026-10-23-pr1/raw.zip)
+includes source/build manifests and failed diagnostic attempts.
 
-These numbers characterize the current pre-release implementation. They are not intended to represent internet download speeds.
+## Timing and eligibility
 
-## Environment
+- XDE job timing runs from public `start()` through committed completion.
+  Engine construction and shutdown are separate measurements.
+- XDE payload timing spans the first non-empty received payload through final
+  sink consumption. Dispatch timestamps are not payload timestamps.
+- Curl job timing uses libcurl `time_total`, excluding process creation.
+  `time_total - time_starttransfer` is only an approximate payload interval.
+- Alternate competing arms. Report individual observations and paired ratios,
+  including p10, median, p90 and min/max. Ratios of independent medians are not
+  paired speedups. Three pairs provide descriptive evidence, not strong inference.
+- Establish functional correctness separately from timing eligibility. Validate
+  payload protocol, actual topology, range responses, bytes and published content.
+- Reject correctness failures, mismatched workloads or explicitly identified
+  exceptional interference. Preserve reasons. Retain slow observations; utilization
+  percentages and unfavorable throughput do not disqualify a trial.
+- Preserve historical validity labels. A new analysis is a separate artifact with
+  raw-file hashes and an explicit policy; it does not rewrite the original rows.
 
-* Windows 11 pro
-* Intel Core Ultra 9 285K
-* Rust 1.98
-* release profile: `opt-level = 3`, ThinLTO, `codegen-units = 1`
-* curl 8.21 with nghttp2
-* file destination
-* loopback HTTP server
-* throughput measured until the download job completes
-* engine shutdown is excluded from throughput
+## CPU attribution
 
-XDE and curl runs are alternated within paired benchmarks to reduce ordering bias.
+Record before/after idle windows, total system CPU during the transfer, controlled
+process CPU and the unattributed residual. Keep interval samples and raw counters.
+On Windows the recorder combines `GetSystemTimes` and `GetProcessTimes`, using
+consistent sample boundaries and processor-normalized deltas. The fixture runs
+in the client process; registered curl CPU is included when applicable.
 
-## Single connection
+Unattributed CPU is not automatically unrelated interference. Interrupts, kernel
+work, process attribution and sample alignment can affect the residual. Independent
+process or ETW observations can explain it. CPU and spikes are diagnostic metadata;
+there is no arbitrary 5% or other utilization rejection threshold. Low aggregate
+CPU also cannot prove absence of contention on a critical core.
 
-One connection, one stream.
+Finish builds, tests and diagnostic profiling before deliberate timing trials.
+Use profiling to investigate unexplained variance, then measure without it. Report
+uncertainty when the machine remains variable.
 
-### 16 MiB
+## Protocol and topology evidence
 
-| Protocol |      XDE median |     curl median | Difference |
-| -------- | --------------: | --------------: | ---------: |
-| HTTP/1.1 | **569.5 MiB/s** |     447.5 MiB/s | **+27.3%** |
-| HTTP/2   |     250.0 MiB/s | **386.3 MiB/s** |     -35.3% |
+H3 payload requires explicit H3 policy and payload assertions; an H1 Alt-Svc probe
+is discovery traffic. Same-connection multiplexing requires overlapping active
+request streams, independently checked by the fixture. Request count is insufficient.
 
-11 measured trials after 2 warmups.
+Connection identities over a transfer's lifetime are distinct from concurrent
+physical connections. H1 truncation may require replacement connections. Record
+lifetime identities, concurrent payload connections and the reservation peak,
+including opening/closing connections. Apply hard engine connection limits during
+fixed-topology runs. Preserve per-request protocol and lifecycle evidence.
 
-### 256 MiB
+Fixture delay postpones response handling. It is not network RTT and cannot
+support BDP or congestion-control claims. H3 curl discovery/routing is not an
+equivalent workload; the runner does not pair it with XDE.
 
-| Protocol |       XDE median |     curl median | Difference |
-| -------- | ---------------: | --------------: | ---------: |
-| HTTP/1.1 | **1516.7 MiB/s** |    1123.3 MiB/s | **+35.0%** |
-| HTTP/2   |      551.1 MiB/s | **803.8 MiB/s** |     -31.4% |
+## Existing diagnostics
 
-7 measured trials after 1 warmup.
+`xde-bench --pipeline a|b|c|d|e` uses the production controller and HTTP lifecycle:
 
-HTTP/1.1 currently performs very well on loopback.
+| Stage | Added work |
+| --- | --- |
+| A | Receive, response/range validation, discard |
+| B | Payload ownership and memory budgeting |
+| C | Destination capacity acquisition/release |
+| D | Batching, copies and permit retention without OS writes |
+| E | Production positional file writes and publication |
 
-HTTP/2 remains a known performance gap. Correctness is not affected; the current issue is throughput and variance on the Windows receive path.
+A-D are diagnostic discard workloads. E requires read-back verification of the
+published artifact. Diagnostic phase timers do not replace job throughput.
 
-HTTP/3 is supported by XDE but is not included here because the curl build used for these measurements does not support HTTP/3.
+`write-probe --mode proactor|runtime|busy` compares direct Proactor, idle Runtime
+and controlled runnable-task pressure. Use matching 64 KiB operations at depths
+1/2/4/8 for shared disjoint positional regions and separate files. Preserve output
+verification, latency distributions, ready/pending behavior, driver counts,
+pressure activity and effective in-flight operations. A service-rate plateau does
+not prove serialization.
 
-## Multi-connection scaling
+The pinned Compio revision is `3d9933787fc3e6c9b0e8ce9241b568cd40c862f6`, including
+the [IOCP progress correction](https://github.com/compio-rs/compio/commit/16d81e265c4806483c5677ba87d36002808da067).
+A wake must not suppress polling pending completions. Keep the regression; that
+fix does not explain every historical latency observation.
 
-256 MiB HTTP/1.1 download with the fixture capped at 100 MiB/s per physical connection.
+## Reporting
 
-| Connections |  Throughput | Scaling |
-| ----------: | ----------: | ------: |
-|           1 |  99.4 MiB/s |   1.00× |
-|           2 | 197.1 MiB/s |   1.98× |
-|           3 | 293.1 MiB/s |   2.95× |
-|           4 | 388.9 MiB/s |   3.91× |
+Record workload size/duration, actual protocol and topology, hardware/OS,
+compiler, locked dependency/source identities, file setup and durability, CPU
+attribution, resource counters, all observations, paired distributions and
+correctness impact. Keep builds with different source/configuration identities in
+separate cohorts. Use separate Cargo target directories for reference source trees.
 
-XDE reaches near-linear scaling through four physical connections under an independent per-connection bottleneck.
+Buffered file writes, cache throughput, verified publication and durable device
+throughput are different metrics. Loopback is useful for isolation; genuine network
+latency, loss and shared-link behavior require independently validated experiments.
 
-## Adaptive mode
-
-The adaptive benchmark uses a 256 MiB artifact with each connection capped at 4 MiB/s.
-
-Three independent runs:
-
-| Run | Throughput | Connections accepted |
-| --: | ---------: | -------------------: |
-|   1 | 10.8 MiB/s |                    7 |
-|   2 | 10.8 MiB/s |                    7 |
-|   3 | 10.8 MiB/s |                    7 |
-
-This benchmark exercises automatic connection exploration rather than a fixed connection count.
-
-## Reproducing
-
-Single-flow comparison:
-
-```bash
-cargo run --release -p xde-bench -- \
-  --suite single \
-  --size-mib 256 \
-  --trials 7 \
-  --warmup 1
-```
-
-Scaling:
-
-```bash
-cargo run --release -p xde-bench -- \
-  --suite scaling \
-  --size-mib 256 \
-  --trials 5 \
-  --warmup 1
-```
-
-Adaptive mode:
-
-```bash
-cargo run --release -p xde-bench -- \
-  --suite adaptive \
-  --size-mib 256 \
-  --trials 1 \
-  --warmup 0
-```
-
-## Interpretation
-
-These are local system benchmarks, primarily useful for comparing implementations under controlled conditions.
-
-The current results show:
-
-* strong HTTP/1.1 single-flow throughput
-* near-linear multi-connection scaling
-* stable adaptive behavior in the capped fixture
-* a remaining HTTP/2 performance gap on Windows
-
-See the benchmark harness in `crates/xde-bench` for the implementation and fixtures.
+[Adaptive intelligence results](docs/adaptive-intelligence-results.md) records the current policy validation and matched measurements.

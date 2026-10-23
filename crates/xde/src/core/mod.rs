@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod allocator;
 pub mod context;
 pub mod controller;
 pub mod credentials;
@@ -15,6 +16,7 @@ pub mod events;
 pub mod ewma;
 pub mod ids;
 pub mod metrics;
+pub mod planner;
 pub mod policy;
 pub mod profile;
 pub mod provenance;
@@ -30,8 +32,8 @@ pub mod world;
 pub use disposition::Disposition;
 pub use error::{Error, Result, RuntimeError};
 pub use ids::{
-    ArtifactId, AssignId, AssignmentRef, ConnectionId, DestinationId, EndpointId, JobId,
-    NetworkContextId, OriginId, PathId, SessionId, SourceId, StreamId,
+    AssignId, AssignmentRef, ConnectionId, EndpointId, JobId, NetworkContextId, OriginId, PathId,
+    SessionId, SourceId, StreamId,
 };
 pub use provenance::ArtifactProvenance;
 pub use ranges::{ByteRange, RangeSet};

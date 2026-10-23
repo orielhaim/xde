@@ -46,7 +46,7 @@ fn poisoned_h1_is_refilled() {
     let env = DownloadEnv::new();
     let engine = test_engine();
     let policy = TransferPolicy {
-        initial_physical_connections: 1,
+        topology: xde::TopologyPolicy::Fixed(xde::Topology::new(1, 1)),
         transport: TransportLimits {
             max_physical_connections: 4,
             ..Default::default()
@@ -85,8 +85,7 @@ fn h2_sibling_survives_truncated_stream() {
     let env = DownloadEnv::new();
     let engine = test_engine_h2();
     let policy = TransferPolicy {
-        initial_physical_connections: 1,
-        initial_streams_per_connection: 2,
+        topology: xde::TopologyPolicy::Fixed(xde::Topology::new(1, 2)),
         transport: TransportLimits {
             max_physical_connections: 2,
             max_streams_per_connection: 8,
@@ -108,8 +107,12 @@ fn h2_sibling_survives_truncated_stream() {
 }
 
 #[test]
-fn h3_discovery_carries_bytes() {
-    let spec = FixtureSpec::default().with_size(2 * 1024 * 1024);
+fn alt_svc_uses_an_available_fixed_connection_grant() {
+    let spec = FixtureSpec {
+        size: 8 << 20,
+        per_connection_bps: Some(4 << 20),
+        ..Default::default()
+    };
     let server = spawn_h1h3(spec.clone());
     let env = DownloadEnv::new();
     let engine = Engine::builder()
@@ -121,7 +124,10 @@ fn h3_discovery_carries_bytes() {
     let job = engine
         .download(server.url())
         .to(&env.path)
-        .policy(conservative_policy())
+        .policy(TransferPolicy {
+            topology: xde::TopologyPolicy::Fixed(xde::Topology::new(2, 1)),
+            ..conservative_policy()
+        })
         .start()
         .unwrap();
     let handle = std::thread::spawn(move || {
@@ -196,4 +202,109 @@ fn retry_after_does_not_spin() {
         "429 Retry-After must prevent early reclaim, requests={requests}"
     );
     let _ = AtomicUsize::new(0);
+}
+#[test]
+fn required_h3_never_uses_discovery_tcp_for_payload() {
+    let spec = xde_test::FixtureSpec::small().with_size(2 * 1024 * 1024);
+    let server = xde_test::spawn_h1h3(spec.clone());
+    let env = xde_test::DownloadEnv::new();
+    let engine = xde::Engine::builder()
+        .shards(1)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let mut policy = xde_test::conservative_policy();
+    policy.http_version = xde::HttpVersionPolicy::Http3Only;
+    let job = engine
+        .download(server.url())
+        .to(&env.path)
+        .policy(policy)
+        .start()
+        .unwrap();
+    assert_eq!(xde_test::wait_job(job).unwrap().bytes, spec.size);
+    xde_test::assert_bytes_match(&env.path, spec.size);
+    assert!(
+        server
+            .stats
+            .h3_payload_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+            >= spec.size
+    );
+    assert_eq!(
+        server.stats.bytes_sent(),
+        1,
+        "TCP carried only the range probe"
+    );
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn required_h3_without_discovery_fails() {
+    let server = xde_test::spawn_h1(xde_test::FixtureSpec::small());
+    let env = xde_test::DownloadEnv::new();
+    let engine = xde_test::test_engine();
+    let mut policy = xde_test::conservative_policy();
+    policy.http_version = xde::HttpVersionPolicy::Http3Only;
+    let job = engine
+        .download(server.url())
+        .to(&env.path)
+        .policy(policy)
+        .start()
+        .unwrap();
+    assert!(xde_test::wait_job(job).is_err());
+    assert!(!env.path.exists());
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn h3_batching_makes_progress_with_a_budget_of_two_batches() {
+    let spec = FixtureSpec::small().with_size(2 * 1024 * 1024);
+    let server = xde_test::spawn_h1h3(spec.clone());
+    let env = DownloadEnv::new();
+    let engine = Engine::builder()
+        .shards(1)
+        .memory_limit(128 * 1024)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let policy = TransferPolicy {
+        http_version: xde::HttpVersionPolicy::Http3Only,
+        topology: xde::TopologyPolicy::Fixed(xde::Topology::new(1, 4)),
+        transport: TransportLimits {
+            max_physical_connections: 1,
+            max_streams_per_connection: 4,
+            max_active_assignments: 4,
+        },
+        ..Default::default()
+    };
+    let job = engine
+        .download(server.url())
+        .to(&env.path)
+        .policy(policy)
+        .start()
+        .unwrap();
+    assert_eq!(wait_job(job).unwrap().bytes, spec.size);
+    assert_bytes_match(&env.path, spec.size);
+    assert_eq!(engine.snapshot().unwrap().memory_used, 0);
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn range_loss_restarts_and_publishes_the_entire_representation() {
+    let spec = xde_test::FixtureSpec {
+        size: 2 * 1024 * 1024,
+        ranges: xde_test::RangeBehavior::LostAfter(1),
+        ..Default::default()
+    };
+    let server = xde_test::spawn_h1(spec.clone());
+    let env = xde_test::DownloadEnv::new();
+    let engine = xde_test::test_engine();
+    let job = engine.download(server.url()).to(&env.path).start().unwrap();
+    assert_eq!(xde_test::wait_job(job).unwrap().bytes, spec.size);
+    xde_test::assert_bytes_match(&env.path, spec.size);
+    engine.shutdown().unwrap();
+    server.shutdown();
 }

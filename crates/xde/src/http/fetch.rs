@@ -80,9 +80,21 @@ pub struct FullBodyFetch {
 
 /// Callback invoked with protocol-owned data and its absolute offset.
 pub trait ChunkSink {
+    #[cfg(feature = "diagnostics")]
+    fn discard_received(&mut self, _bytes: usize) -> bool {
+        false
+    }
+
     fn accept(&mut self, chunk: TransferChunk) -> impl Future<Output = Result<()>>;
     fn finish(&mut self) -> impl Future<Output = Result<()>> {
         async { Ok(()) }
+    }
+
+    /// Coarse consumed progress, published at 64 KiB boundaries and completion.
+    fn report_progress(&mut self, _bytes: u64, _local_wait: Duration) {}
+
+    fn destination_stats(&self) -> crate::core::metrics::DestinationStats {
+        Default::default()
     }
 
     /// Exclusive absolute offset currently wanted by the scheduler. A sink may
@@ -102,6 +114,21 @@ pub trait ChunkSink {
     fn progress_class(&self, _offset: u64) -> crate::storage::ProgressClass {
         crate::storage::ProgressClass::Speculative
     }
+}
+
+async fn observe_wait<F: Future>(future: F, waited: &mut Duration) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut pending_since = None;
+    std::future::poll_fn(|cx| {
+        let poll = future.as_mut().poll(cx);
+        if poll.is_pending() {
+            pending_since.get_or_insert_with(Instant::now);
+        } else if let Some(start) = pending_since.take() {
+            *waited += start.elapsed();
+        }
+        poll
+    })
+    .await
 }
 
 fn observe_identity(
@@ -132,6 +159,7 @@ async fn deliver_range_bytes<S: ChunkSink>(
     useful_received: &mut u64,
     truncated: &mut bool,
     memory_blocked: &mut Duration,
+    memory_wait: &mut Duration,
     destination_blocked: &mut Duration,
     dest_accepts: &mut u64,
 ) -> Result<()> {
@@ -154,23 +182,37 @@ async fn deliver_range_bytes<S: ChunkSink>(
         }
         let amount = (data.len() - consumed)
             .min((dynamic_end - *offset) as usize)
-            .min(memory.limit() as usize)
+            .min(memory.max_payload_bytes())
             .min(sink.max_chunk_size());
-        let payload = data.slice(consumed..consumed + amount);
-        let mem_started = Instant::now();
-        let class = sink.progress_class(*offset);
-        let chunk = TransferChunk::bytes_classed(*offset, payload, memory, class, context).await?;
-        *memory_blocked += mem_started.elapsed();
-        let dest_started = Instant::now();
-        sink.accept(chunk).await?;
-        *destination_blocked += dest_started.elapsed();
-        *dest_accepts += 1;
+        #[cfg(feature = "diagnostics")]
+        let discarded = sink.discard_received(amount);
+        #[cfg(not(feature = "diagnostics"))]
+        let discarded = false;
+        if !discarded {
+            let mem_started = Instant::now();
+            let payload = data.slice(consumed..consumed + amount);
+            let class = sink.progress_class(*offset);
+            let chunk = observe_wait(
+                TransferChunk::bytes_classed(*offset, payload, memory, class, context),
+                memory_wait,
+            )
+            .await?;
+            *memory_blocked += mem_started.elapsed();
+            let dest_started = Instant::now();
+            sink.accept(chunk).await?;
+            *destination_blocked += dest_started.elapsed();
+            *dest_accepts += 1;
+        }
         consumed += amount;
         *offset += amount as u64;
         *received += amount as u64;
+        let before = *useful_received / (64 * 1024);
         let owned_start = (*offset - amount as u64).max(fetch.range.start);
         let owned_end = (*offset).min(fetch.range.end);
         *useful_received = useful_received.saturating_add(owned_end.saturating_sub(owned_start));
+        if *useful_received / (64 * 1024) != before {
+            sink.report_progress(*useful_received, *memory_wait + *destination_blocked);
+        }
     }
     Ok(())
 }
@@ -212,11 +254,12 @@ pub async fn fetch_range<S: ChunkSink>(
         .map_err(|error| Error::protocol(error.to_string()))?;
 
     let started = Instant::now();
-    let mut response = before_deadline(
-        fetch.source.deadline,
-        crate::net::h3::send_get(conn, request),
-    )
-    .await?;
+    let mut response = context
+        .run(before_deadline(
+            fetch.source.deadline,
+            crate::net::h3::send_get(conn, request),
+        ))
+        .await?;
     let ttfb = started.elapsed();
     let send_ready = response.send_ready;
     let header_wait = response.header_wait;
@@ -291,13 +334,16 @@ pub async fn fetch_range<S: ChunkSink>(
     let mut truncated = false;
     let mut receive_active = Duration::ZERO;
     let mut memory_blocked = Duration::ZERO;
+    let mut memory_wait = Duration::ZERO;
     let mut destination_blocked = Duration::ZERO;
     let mut dest_accepts = 0_u64;
     let body = &mut response.body;
     let io0 = crate::net::hyper_io::io_read_snapshot();
     loop {
         let recv_started = Instant::now();
-        let data = before_deadline(fetch.source.deadline, body.next_data()).await?;
+        let data = context
+            .run(before_deadline(fetch.source.deadline, body.next_data()))
+            .await?;
         receive_active += recv_started.elapsed();
         let Some(data) = data else { break };
         deliver_range_bytes(
@@ -312,6 +358,7 @@ pub async fn fetch_range<S: ChunkSink>(
             &mut useful_received,
             &mut truncated,
             &mut memory_blocked,
+            &mut memory_wait,
             &mut destination_blocked,
             &mut dest_accepts,
         )
@@ -321,7 +368,10 @@ pub async fn fetch_range<S: ChunkSink>(
         }
     }
 
+    let finish_started = Instant::now();
     sink.finish().await?;
+    let sink_finished = Instant::now();
+    destination_blocked += sink_finished.saturating_duration_since(finish_started);
     let response_wall = started.elapsed().max(Duration::from_nanos(1));
 
     if !truncated
@@ -356,14 +406,16 @@ pub async fn fetch_range<S: ChunkSink>(
             HttpSession::Http2(sender) => sender.is_ready() && !sender.is_closed(),
             HttpSession::Http3(_) => true,
         };
+    sink.report_progress(useful_received, memory_wait + destination_blocked);
     let io = io_delta(io0);
     Ok(RangeFetchOutcome {
         sample: TransferSample {
             bytes: useful_received,
             ttfb,
             response_wall,
-            receive_active: body.stats.pending,
+            receive_active,
             memory_blocked,
+            memory_wait,
             destination_blocked,
             next_pending: body.stats.pending,
             max_frame_gap: body.stats.max_gap,
@@ -371,6 +423,11 @@ pub async fn fetch_range<S: ChunkSink>(
             headers: header_wait,
             data_frames: body.stats.data_frames,
             dest_accepts,
+            destination: sink.destination_stats(),
+            payload: crate::core::metrics::PayloadTiming {
+                first_received: body.stats.first_payload,
+                sink_finished: Some(sink_finished),
+            },
             copy_count: body.stats.copy_count,
             copied_bytes: body.stats.copied_bytes,
             frame_p50: body.stats.frame_percentile(50.0),
@@ -448,11 +505,12 @@ pub async fn fetch_full_body<S: ChunkSink>(
         .map_err(|error| Error::protocol(error.to_string()))?;
 
     let started = Instant::now();
-    let mut response = before_deadline(
-        fetch.source.deadline,
-        crate::net::h3::send_get(conn, request),
-    )
-    .await?;
+    let mut response = context
+        .run(before_deadline(
+            fetch.source.deadline,
+            crate::net::h3::send_get(conn, request),
+        ))
+        .await?;
     let ttfb = started.elapsed();
     let send_ready = response.send_ready;
     let header_wait = response.header_wait;
@@ -503,39 +561,59 @@ pub async fn fetch_full_body<S: ChunkSink>(
     let mut offset = 0_u64;
     let mut receive_active = Duration::ZERO;
     let mut memory_blocked = Duration::ZERO;
+    let mut memory_wait = Duration::ZERO;
     let mut destination_blocked = Duration::ZERO;
     let mut dest_accepts = 0_u64;
     let io0 = crate::net::hyper_io::io_read_snapshot();
     loop {
         let recv_started = Instant::now();
-        let data = before_deadline(fetch.source.deadline, body.next_data()).await?;
+        let data = context
+            .run(before_deadline(fetch.source.deadline, body.next_data()))
+            .await?;
         receive_active += recv_started.elapsed();
         let Some(data) = data else { break };
         let mut consumed = 0;
         while consumed < data.len() {
             let amount = (data.len() - consumed)
-                .min(memory.limit() as usize)
+                .min(memory.max_payload_bytes())
                 .min(sink.max_chunk_size());
-            let mem_started = Instant::now();
-            let class = sink.progress_class(offset);
-            let chunk = TransferChunk::bytes_classed(
-                offset,
-                data.slice(consumed..consumed + amount),
-                memory,
-                class,
-                context,
-            )
-            .await?;
-            memory_blocked += mem_started.elapsed();
-            let dest_started = Instant::now();
-            sink.accept(chunk).await?;
-            destination_blocked += dest_started.elapsed();
-            dest_accepts += 1;
+            #[cfg(feature = "diagnostics")]
+            let discarded = sink.discard_received(amount);
+            #[cfg(not(feature = "diagnostics"))]
+            let discarded = false;
+            if !discarded {
+                let mem_started = Instant::now();
+                let class = sink.progress_class(offset);
+                let chunk = observe_wait(
+                    TransferChunk::bytes_classed(
+                        offset,
+                        data.slice(consumed..consumed + amount),
+                        memory,
+                        class,
+                        context,
+                    ),
+                    &mut memory_wait,
+                )
+                .await?;
+                memory_blocked += mem_started.elapsed();
+                let dest_started = Instant::now();
+                sink.accept(chunk).await?;
+                destination_blocked += dest_started.elapsed();
+                dest_accepts += 1;
+            }
             consumed += amount;
+            let before = offset / (64 * 1024);
             offset += amount as u64;
+            if offset / (64 * 1024) != before {
+                sink.report_progress(offset, memory_wait + destination_blocked);
+            }
         }
     }
+    let finish_started = Instant::now();
     sink.finish().await?;
+    let sink_finished = Instant::now();
+    destination_blocked += sink_finished.saturating_duration_since(finish_started);
+    sink.report_progress(offset, memory_wait + destination_blocked);
     let io = io_delta(io0);
     let response_wall = started.elapsed().max(Duration::from_nanos(1));
     if let Some(expected) = expected
@@ -557,8 +635,9 @@ pub async fn fetch_full_body<S: ChunkSink>(
             bytes: offset,
             ttfb,
             response_wall,
-            receive_active: body.stats.pending,
+            receive_active,
             memory_blocked,
+            memory_wait,
             destination_blocked,
             next_pending: body.stats.pending,
             max_frame_gap: body.stats.max_gap,
@@ -566,6 +645,11 @@ pub async fn fetch_full_body<S: ChunkSink>(
             headers: header_wait,
             data_frames: body.stats.data_frames,
             dest_accepts,
+            destination: sink.destination_stats(),
+            payload: crate::core::metrics::PayloadTiming {
+                first_received: body.stats.first_payload,
+                sink_finished: Some(sink_finished),
+            },
             copy_count: body.stats.copy_count,
             copied_bytes: body.stats.copied_bytes,
             frame_p50: body.stats.frame_percentile(50.0),

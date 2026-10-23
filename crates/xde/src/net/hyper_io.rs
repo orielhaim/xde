@@ -182,10 +182,8 @@ where
     }
 }
 
-impl<S: Splittable + 'static> hyper::rt::Read for CompioIo<TlsStream<S>>
-where
-    S::ReadHalf: AsyncRead + Unpin,
-    S::WriteHalf: AsyncWrite + Unpin,
+impl<S: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin + 'static> hyper::rt::Read
+    for CompioIo<TlsStream<S>>
 {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -225,10 +223,8 @@ where
     }
 }
 
-impl<S: Splittable + 'static> hyper::rt::Write for CompioIo<TlsStream<S>>
-where
-    S::ReadHalf: AsyncRead + Unpin,
-    S::WriteHalf: AsyncWrite + Unpin,
+impl<S: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin + 'static> hyper::rt::Write
+    for CompioIo<TlsStream<S>>
 {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -256,5 +252,122 @@ where
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         futures_util::AsyncWrite::poll_close(self.inner.as_mut().as_mut(), cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{body::EngineBody, exec::CompioExec};
+    use bytes::Bytes;
+    use http_body::Body;
+    use std::{convert::Infallible, sync::Arc};
+
+    #[rstest::rstest]
+    #[case::h1(false)]
+    #[case::h2(true)]
+    fn tls_bridge_receives_the_complete_response(#[case] h2: bool) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let alpn = if h2 {
+            b"h2".to_vec()
+        } else {
+            b"http/1.1".to_vec()
+        };
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::from(key),
+            )
+            .unwrap();
+        server_config.alpn_protocols = vec![alpn.clone()];
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![alpn.clone()];
+        let expected: Vec<_> = (0..128 * 1024).map(|n| (n % 251) as u8).collect();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            compio::time::timeout(Duration::from_secs(10), async {
+                let listener = compio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .unwrap();
+                let addr = listener.local_addr().unwrap();
+                let payload = Bytes::from(expected.clone());
+                let server = compio::runtime::spawn(async move {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let tls = compio::tls::TlsAcceptor::from(Arc::new(server_config))
+                        .accept(Box::pin(AsyncStream::new(tcp)))
+                        .await
+                        .unwrap();
+                    let service = hyper::service::service_fn(move |_| {
+                        let body = payload.clone();
+                        async move {
+                            Ok::<_, Infallible>(http::Response::new(EngineBody::from_bytes(body)))
+                        }
+                    });
+                    if h2 {
+                        let _ = hyper::server::conn::http2::Builder::new(CompioExec)
+                            .serve_connection(CompioIo::new(tls), service)
+                            .await;
+                    } else {
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(CompioIo::new(tls), service)
+                            .await;
+                    }
+                });
+                let tcp = compio::net::TcpStream::connect(addr).await.unwrap();
+                let tls = compio::tls::TlsConnector::from(Arc::new(client_config))
+                    .connect("localhost", Box::pin(AsyncStream::new(tcp)))
+                    .await
+                    .unwrap();
+                assert_eq!(tls.negotiated_alpn().unwrap(), alpn);
+                let request = http::Request::builder()
+                    .uri("https://localhost/artifact")
+                    .body(EngineBody::empty())
+                    .unwrap();
+                let (response, driver) = if h2 {
+                    let (mut sender, connection) =
+                        hyper::client::conn::http2::Builder::new(CompioExec)
+                            .handshake(CompioIo::new(tls))
+                            .await
+                            .unwrap();
+                    let driver = compio::runtime::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    (sender.send_request(request).await.unwrap(), driver)
+                } else {
+                    let (mut sender, connection) =
+                        hyper::client::conn::http1::handshake(CompioIo::new(tls))
+                            .await
+                            .unwrap();
+                    let driver = compio::runtime::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    (sender.send_request(request).await.unwrap(), driver)
+                };
+                assert_eq!(response.status(), 200);
+                let mut body = Box::pin(response.into_body());
+                let mut received = Vec::new();
+                while let Some(frame) =
+                    std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await
+                {
+                    if let Ok(data) = frame.unwrap().into_data() {
+                        received.extend_from_slice(&data);
+                    }
+                }
+                assert_eq!(received, expected);
+                let _ = driver.cancel().await;
+                let _ = server.cancel().await;
+            })
+            .await
+            .unwrap();
+        });
     }
 }

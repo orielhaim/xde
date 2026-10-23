@@ -17,9 +17,9 @@ rust-version = "1.98"
 
 [workspace.dependencies]
 # runtime / data plane
-compio = { version = "0.19", features = ["runtime", "io", "fs", "net", "tls", "rustls", "time", "macros"] }
-compio-io = { version = "0.10", features = ["compat"] }
-compio-buf = { version = "0.8", features = ["bytes", "smallvec"] }
+compio = { git = "https://github.com/compio-rs/compio", rev = "3d9933787fc3e6c9b0e8ce9241b568cd40c862f6", features = ["runtime", "io", "fs", "net", "tls", "rustls", "time", "macros"] }
+compio-io = { git = "https://github.com/compio-rs/compio", rev = "3d9933787fc3e6c9b0e8ce9241b568cd40c862f6", features = ["compat"] }
+compio-buf = { git = "https://github.com/compio-rs/compio", rev = "3d9933787fc3e6c9b0e8ce9241b568cd40c862f6", features = ["bytes", "smallvec"] }
 
 # http
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -35,11 +35,12 @@ aws-lc-rs = "1"
 httpdate = "1"
 
 # http/3
-compio-quic = { version = "0.8.2", features = ["h3", "platform-verifier"] }
+compio-quic = { git = "https://github.com/compio-rs/compio", rev = "3d9933787fc3e6c9b0e8ce9241b568cd40c862f6", features = ["h3", "platform-verifier"] }
 h3 = "0.0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs"] }
 
 # transport
+getifs = "0.7"
 socket2 = { version = "0.6", features = ["all"] }
 rustix = { version = "1", features = ["fs", "std"] }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

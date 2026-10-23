@@ -4,7 +4,26 @@
 //! endpoint capacity. Every duration class is captured separately so future
 //! learning consumes only receive-active evidence.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PayloadTiming {
+    pub first_received: Option<Instant>,
+    /// All payload has reached the sink's finish barrier. Excludes final
+    /// artifact hashing and publication, but includes pending batch writes.
+    pub sink_finished: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DestinationStats {
+    pub operations: u64,
+    pub bytes: u64,
+    pub copied_bytes: u64,
+    pub capacity_wait: Duration,
+    pub capacity_acquire: Duration,
+    pub batch_copy: Duration,
+    pub write_await: Duration,
+}
 
 /// What one HTTP request's execution actually looked like, split by where
 /// the time went.
@@ -20,6 +39,7 @@ pub struct TransferSample {
     pub receive_active: Duration,
     /// Time blocked acquiring transfer-memory credit.
     pub memory_blocked: Duration,
+    pub memory_wait: Duration,
     /// Time blocked handing payload to the destination.
     pub destination_blocked: Duration,
     /// Time `next_data` spent in Poll::Pending (socket/driver, not dest).
@@ -33,6 +53,8 @@ pub struct TransferSample {
     pub data_frames: u64,
     /// `sink.accept` calls for this request.
     pub dest_accepts: u64,
+    pub destination: DestinationStats,
+    pub payload: PayloadTiming,
     /// XDE memcpy operations of payload bytes (0 on the normal H1/H2 path).
     pub copy_count: u64,
     /// Bytes those operations copied.

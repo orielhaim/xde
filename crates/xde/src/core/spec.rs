@@ -148,15 +148,14 @@ pub enum Priority {
 }
 
 impl Priority {
-    /// Weight used by the max-min allocator. Deliberately super-linear so
-    /// Critical actually dominates instead of politely queueing.
+    /// Each priority step doubles the weight of contended admission opportunities.
     pub fn weight(self) -> f64 {
         match self {
-            Priority::Background => 0.25,
-            Priority::Low => 1.0,
+            Priority::Background => 1.0,
+            Priority::Low => 2.0,
             Priority::Normal => 4.0,
-            Priority::High => 12.0,
-            Priority::Critical => 40.0,
+            Priority::High => 8.0,
+            Priority::Critical => 16.0,
         }
     }
 }

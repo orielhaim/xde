@@ -30,18 +30,7 @@ pub enum TimerEvent {
     /// Adaptive topology tick for one origin: measure aggregate rate since
     /// last tick and decide whether to open/close connections.
     AdaptiveTick {
-        origin: OriginId,
-    },
-    /// A retired connection still has in-flight assignments; check again
-    /// whether it has drained and can be closed without aborting work.
-    DrainConnection {
-        connection: crate::core::ids::ConnectionId,
-    },
-    /// Medium-timescale rebalance for one origin: detect stragglers, shrink
-    /// them to a fair share, and let fast workers pick up the released
-    /// tails.
-    RebalanceTick {
-        origin: OriginId,
+        job: JobId,
     },
 }
 

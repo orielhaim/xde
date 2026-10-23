@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -67,6 +67,7 @@ pub fn spawn_h2c(spec: FixtureSpec) -> H2Server {
                     let stop = stop.clone();
                     let global_requests = global_requests.clone();
                     tokio::spawn(async move {
+                        let active = Arc::new(AtomicUsize::new(0));
                         let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                             .max_frame_size(1024 * 1024)
                             .initial_stream_window_size(64 * 1024 * 1024)
@@ -78,14 +79,20 @@ pub fn spawn_h2c(spec: FixtureSpec) -> H2Server {
                                     let stats = stats.clone();
                                     let stop = stop.clone();
                                     let global_requests = global_requests.clone();
+                                    let active = active.clone();
                                     async move {
-                                        Ok::<_, Infallible>(respond(
-                                            req,
-                                            spec,
-                                            stats,
-                                            stop,
-                                            global_requests,
-                                        ))
+                                        let count = active.fetch_add(1, Ordering::AcqRel) + 1;
+                                        stats
+                                            .h2_peak_streams_per_connection
+                                            .fetch_max(count, Ordering::AcqRel);
+                                        let request = ActiveRequest(active);
+                                        if spec.latency > Duration::ZERO {
+                                            tokio::time::sleep(spec.latency).await;
+                                        }
+                                        let mut response =
+                                            respond(req, spec, stats, stop, global_requests);
+                                        response.body_mut().active = Some(request);
+                                        Ok::<_, Infallible>(response)
                                     }
                                 }),
                             )
@@ -113,9 +120,6 @@ fn respond(
 ) -> http::Response<PayloadBody> {
     stats.requests.fetch_add(1, Ordering::AcqRel);
     let nth = global_requests.fetch_add(1, Ordering::AcqRel) + 1;
-    if spec.latency > Duration::ZERO {
-        std::thread::sleep(spec.latency);
-    }
     if let Some(redir) = &spec.redirect {
         return http::Response::builder()
             .status(redir.status)
@@ -135,7 +139,8 @@ fn respond(
         .headers()
         .get("range")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| parse_http_range(v, spec.size));
+        .and_then(|v| parse_http_range(v, spec.size))
+        .filter(|_| spec.ranges.honors(nth));
     let (start, end_incl) = range.unwrap_or((0, spec.size.saturating_sub(1)));
     let mut reset_after: Option<u64> = None;
     if spec.reset_nth == Some(nth) {
@@ -163,6 +168,9 @@ fn respond(
             .header("content-length", spec.size.to_string());
     }
     b.body(PayloadBody {
+        egress: spec.egress.map(|budget| budget.session()),
+        pacing: None,
+        active: None,
         start,
         end_incl,
         sent: 0,
@@ -186,7 +194,17 @@ fn parse_http_range(v: &str, total: u64) -> Option<(u64, u64)> {
     Some((s, e.min(total.saturating_sub(1))))
 }
 
+struct ActiveRequest(Arc<AtomicUsize>);
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub(crate) struct PayloadBody {
+    egress: Option<crate::spec::EgressSession>,
+    pacing: Option<Pin<Box<tokio::time::Sleep>>>,
+    active: Option<ActiveRequest>,
     start: u64,
     end_incl: u64,
     sent: u64,
@@ -210,6 +228,9 @@ impl std::error::Error for StreamReset {}
 impl PayloadBody {
     fn empty() -> Self {
         Self {
+            egress: None,
+            pacing: None,
+            active: None,
             start: 0,
             end_incl: 0,
             sent: 1,
@@ -227,7 +248,7 @@ impl http_body::Body for PayloadBody {
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = &mut *self;
         if this.stop.load(Ordering::Acquire) {
@@ -249,6 +270,21 @@ impl http_body::Body for PayloadBody {
         }
         if take == 0 {
             return Poll::Ready(Some(Err(StreamReset)));
+        }
+        if let Some(egress) = &mut this.egress {
+            take = take.min(64 * 1024);
+            if this.pacing.is_none() {
+                let wait = egress.delay(take, (total - this.sent) as usize);
+                if !wait.is_zero() {
+                    this.pacing = Some(Box::pin(tokio::time::sleep(wait)));
+                }
+            }
+            if let Some(sleep) = &mut this.pacing
+                && std::future::Future::poll(sleep.as_mut(), cx).is_pending()
+            {
+                return Poll::Pending;
+            }
+            this.pacing = None;
         }
         let mut buf = block[in_block..in_block + take].to_vec();
         if let Some(from) = this.corrupt_from {

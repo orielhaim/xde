@@ -9,11 +9,13 @@ publish = false
 [dependencies]
 xde = { path = "../xde" }
 bytes.workspace = true
+futures-util.workspace = true
 compio.workspace = true
 compio-quic = { workspace = true }
 h3.workspace = true
 http.workspace = true
 http-body.workspace = true
+http-body-util.workspace = true
 hyper = { workspace = true, features = ["server", "http1", "http2"] }
 hyper-util.workspace = true
 rcgen.workspace = true

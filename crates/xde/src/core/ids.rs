@@ -3,7 +3,6 @@ use slotmap::new_key_type;
 new_key_type! {
     /// Generational job handle. A stale JobId can never alias a fresh job.
     pub struct JobId;
-    pub struct ArtifactId;
     pub struct SourceId;
     pub struct OriginId;
     pub struct EndpointId;
@@ -12,7 +11,6 @@ new_key_type! {
     pub struct SessionId;
     pub struct StreamId;
     pub struct AssignId;
-    pub struct DestinationId;
     pub struct NetworkContextId;
 }
 
@@ -57,18 +55,31 @@ impl TransportOriginKey {
     }
 }
 
-/// A globally-unique reference to an assignment: `AssignId` is only unique
-/// within a job's `SegmentPlan`, so any cross-job map or protocol message
-/// must key on this pair instead of the bare `AssignId`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct PlanId(u64);
+
+impl PlanId {
+    pub fn advance(&mut self) {
+        self.0 = self.0.checked_add(1).expect("plan identity exhausted");
+    }
+}
+
+/// Slot-map keys are local to a plan. Every asynchronous reference includes
+/// its plan identity so late messages cannot alias a replacement assignment.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct AssignmentRef {
     pub job: JobId,
+    pub plan: PlanId,
     pub assignment: AssignId,
 }
 
 impl AssignmentRef {
-    pub fn new(job: JobId, assignment: AssignId) -> Self {
-        Self { job, assignment }
+    pub fn new(job: JobId, plan: PlanId, assignment: AssignId) -> Self {
+        Self {
+            job,
+            plan,
+            assignment,
+        }
     }
 }
 

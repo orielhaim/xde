@@ -21,12 +21,12 @@ crc32c.workspace = true
 event-listener.workspace = true
 flume.workspace = true
 futures-util.workspace = true
+getifs.workspace = true
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 h3.workspace = true
 http.workspace = true
 http-body.workspace = true
 httpdate.workspace = true
-getifs = "0.6"
 hyper.workspace = true
 parking_lot.workspace = true
 postcard.workspace = true
@@ -47,6 +47,7 @@ url.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+rcgen.workspace = true
 divan.workspace = true
 proptest.workspace = true
 rstest.workspace = true
@@ -55,6 +56,7 @@ xde-test = { path = "../xde-test" }
 
 [features]
 default = []
+diagnostics = []
 blake3-rayon = ["blake3/rayon"]
 
 [[bench]]
