@@ -2,12 +2,366 @@ use super::*;
 use crate::core::spec::JobSpec;
 use url::Url;
 
+/// Run alone in release mode; output is a diagnostic distribution, never a test threshold.
+#[test]
+#[ignore]
+fn control_scaling_measurements() {
+    use std::hint::black_box;
+    for n in [1, 8, 32, 128, 512] {
+        for shared in [false, true] {
+            for connections in [0, 4] {
+                let mut c = Controller::new();
+                c.limits.max_physical_connections = (n * 4).min(u16::MAX as usize) as u16;
+                c.limits.max_connections_per_origin = c.limits.max_physical_connections;
+                c.limits.max_active_assignments = (n * 8) as u32;
+                let now = Instant::now();
+                let mut jobs = Vec::new();
+                for i in 0..n {
+                    let host = if shared { 0 } else { i };
+                    let mut s = spec(&format!("http://host{host}.test/data"));
+                    s.policy.topology = crate::TopologyPolicy::Fixed(crate::Topology::new(4, 2));
+                    let job = c
+                        .world
+                        .admit_job(
+                            &s,
+                            crate::core::world::DestinationKey::File(format!("out{i}").into()),
+                        )
+                        .unwrap();
+                    force_transferring(&mut c, job, 1 << 30);
+                    let origin = c.world.jobs[job].origin;
+                    c.world
+                        .note_endpoints(origin, &["127.0.0.1:8080".parse().unwrap()]);
+                    let endpoint = c.world.origins[origin].endpoints[0];
+                    for _ in 0..connections {
+                        let id = c.world.allocate_connection(origin, endpoint, 0);
+                        let node = &mut c.world.connections[id];
+                        node.owner = Some(job);
+                        node.protocol = crate::Protocol::Http2;
+                        node.status = ConnectionStatus::Ready;
+                    }
+                    jobs.push(job);
+                }
+                for trial in 0..5 {
+                    let before = c.stats.allocation_passes;
+                    let start = Instant::now();
+                    for _ in 0..8 {
+                        c.grant_demand = None;
+                        c.refresh_grants(black_box(now));
+                    }
+                    println!(
+                        "{{\"kind\":\"refresh\",\"jobs\":{n},\"shared\":{shared},\"connections_per_job\":{connections},\"trial\":{trial},\"ns_per_call\":{},\"passes\":{}}}",
+                        start.elapsed().as_nanos() / 8,
+                        c.stats.allocation_passes - before
+                    );
+                    let start = Instant::now();
+                    for _ in 0..8 {
+                        let connection = c.world.connections.keys().next().unwrap_or_default();
+                        black_box(
+                            c.world
+                                .connections
+                                .get(connection)
+                                .and_then(|node| node.owner)
+                                .is_some_and(|job| c.can_assign(job, connection, now)),
+                        );
+                    }
+                    println!(
+                        "{{\"kind\":\"selection\",\"jobs\":{n},\"shared\":{shared},\"connections_per_job\":{connections},\"trial\":{trial},\"ns_per_call\":{}}}",
+                        start.elapsed().as_nanos() / 8
+                    );
+                }
+                black_box(jobs);
+            }
+        }
+    }
+}
+
+#[test]
+fn grants_reuse_identical_inputs_and_invalidate_on_policy_changes() {
+    let now = Instant::now();
+    let mut c = Controller::new();
+    let a = admit(&mut c, spec("http://a.test/data"), "a", now);
+    let b = admit(&mut c, spec("http://b.test/data"), "b", now);
+    c.refresh_grants(now);
+    let before = c.stats.allocation_passes;
+    let expected = c.world.jobs[a].grant;
+    for _ in 0..8 {
+        c.refresh_grants(now);
+    }
+    assert_eq!(c.stats.allocation_passes, before);
+    assert_eq!(c.world.jobs[a].grant, expected);
+    c.world.jobs[b].priority = crate::Priority::Critical;
+    c.refresh_grants(now);
+    assert_eq!(c.stats.allocation_passes, before + 1);
+    let mut limits = c.limits;
+    limits.max_physical_connections = 1;
+    c.set_engine_limits(&limits);
+    c.refresh_grants(now);
+    assert_eq!(c.stats.allocation_passes, before + 2);
+    assert_eq!(
+        c.world
+            .jobs
+            .values()
+            .map(|j| j.grant.connections as usize)
+            .sum::<usize>(),
+        1
+    );
+    c.world.jobs[a].phase = JobPhase::Paused;
+    c.world.jobs[b].phase = JobPhase::Paused;
+    c.refresh_grants(now);
+    assert!(c.world.jobs.values().all(|j| j.grant == Default::default()));
+}
+
+#[test]
+fn mixed_protocol_capacity_never_turns_serial_connections_into_multiplexed_slots() {
+    let now = Instant::now();
+    let mut c = Controller::new();
+    let mut s = spec("http://mixed.test/data");
+    s.policy.topology = crate::TopologyPolicy::Fixed(crate::Topology::new(4, 4));
+    s.policy.transport.max_active_assignments = 32;
+    let job = admit(&mut c, s, "mixed", now);
+    drive_to_transfer(&mut c, job, now, crate::Protocol::Http2, 1 << 34);
+    let opening: Vec<_> = c
+        .world
+        .connections
+        .iter()
+        .filter(|(_, c)| c.status == ConnectionStatus::Connecting)
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(opening.len(), 3);
+    for connection in opening {
+        c.handle(
+            Observation::ConnectionReady {
+                connection,
+                protocol: crate::Protocol::Http1_1,
+                handshake: Duration::from_millis(1),
+            },
+            now,
+        );
+    }
+    assert_eq!(c.world.jobs[job].grant.assignments, 7);
+    assert_eq!(c.ready_job_capacity(job).slots(4), 7);
+    assert_eq!(c.world.jobs[job].plan.as_ref().unwrap().in_flight(), 7);
+    assert!(!c.globally_constrained(job));
+    let mut limits = c.limits;
+    limits.max_active_assignments = 5;
+    c.set_engine_limits(&limits);
+    c.refresh_grants(now);
+    assert_eq!(c.world.jobs[job].grant.assignments, 5);
+    assert!(c.globally_constrained(job));
+    for (id, connection) in &c.world.connections {
+        assert!(
+            c.in_flight_on(id)
+                <= if connection.protocol == crate::Protocol::Http1_1 {
+                    1
+                } else {
+                    4
+                }
+        );
+    }
+}
+
+#[test]
+fn distinct_active_connections_respect_a_reduced_grant_until_drain() {
+    let now = Instant::now();
+    let mut c = Controller::new();
+    let mut s = spec("http://draining.test/data");
+    s.policy.topology = crate::TopologyPolicy::Fixed(crate::Topology::new(2, 2));
+    let job = admit(&mut c, s, "draining", now);
+    let (_, old) = drive_to_transfer(&mut c, job, now, crate::Protocol::Http2, 1 << 34);
+    let assignments: Vec<_> = c.world.jobs[job]
+        .plan
+        .as_ref()
+        .unwrap()
+        .iter_assignments()
+        .map(|(id, _)| id)
+        .collect();
+    for id in &assignments[1..] {
+        c.world.jobs[job].plan.as_mut().unwrap().abandon(*id);
+        c.release_assignment_slot(Some(old));
+    }
+    let next = c
+        .world
+        .connections
+        .iter()
+        .find(|(_, c)| c.status == ConnectionStatus::Connecting)
+        .unwrap()
+        .0;
+    c.world.connections[next].status = ConnectionStatus::Ready;
+    c.world.connections[next].protocol = crate::Protocol::Http2;
+    c.world.jobs[job].grant = crate::ResourceGrant {
+        connections: 1,
+        assignments: 2,
+    };
+    let mut actions = Vec::new();
+    let origin = c.world.jobs[job].origin;
+    c.pump(&mut actions, origin, now);
+    assert!(
+        !actions.iter().any(
+            |a| matches!(a, Action::StartAssignment { connection, .. } if *connection == next)
+        )
+    );
+    c.world.jobs[job]
+        .plan
+        .as_mut()
+        .unwrap()
+        .abandon(assignments[0]);
+    c.release_assignment_slot(Some(old));
+    c.world.connections[old].status = ConnectionStatus::Retired;
+    c.pump(&mut actions, origin, now);
+    assert!(
+        actions.iter().any(
+            |a| matches!(a, Action::StartAssignment { connection, .. } if *connection == next)
+        )
+    );
+}
+
+#[test]
+fn excess_busy_multiplexed_connections_are_not_replenished_while_draining() {
+    let mut c = Controller::new();
+    let now = Instant::now();
+    let mut s = spec("http://mux-drain.test/data");
+    s.policy.topology = crate::TopologyPolicy::Fixed(crate::Topology::new(2, 4));
+    let job = admit(&mut c, s, "mux-drain", now);
+    let (_, retained) = drive_to_transfer(&mut c, job, now, crate::Protocol::Http2, 1 << 34);
+    let retiring = c
+        .world
+        .connections
+        .iter()
+        .find(|(_, c)| c.status == ConnectionStatus::Connecting)
+        .unwrap()
+        .0;
+    c.handle(
+        Observation::ConnectionReady {
+            connection: retiring,
+            protocol: crate::Protocol::Http2,
+            handshake: Duration::from_millis(1),
+        },
+        now,
+    );
+    assert_eq!(c.in_flight_on(retained), 4);
+    assert_eq!(c.in_flight_on(retiring), 4);
+    let requests = |connection| {
+        c.world.jobs[job]
+            .plan
+            .as_ref()
+            .unwrap()
+            .iter_assignments()
+            .filter(|(_, a)| a.connection == Some(connection))
+            .map(|(id, a)| (c.assignment_ref(job, id), a.range))
+            .collect::<Vec<_>>()
+    };
+    let kept = requests(retained);
+    let drained = requests(retiring);
+    let mut limits = c.limits;
+    limits.max_physical_connections = 1;
+    c.set_engine_limits(&limits);
+    c.reconcile(&mut Vec::new(), now);
+    assert_eq!(
+        c.world.jobs[job].grant,
+        crate::ResourceGrant {
+            connections: 1,
+            assignments: 4
+        }
+    );
+    let mut actions = Vec::new();
+    for (connection, requests) in [(retained, &kept[..2]), (retiring, &drained[..3])] {
+        for &(assignment, range) in requests {
+            actions.extend(c.handle(
+                Observation::AssignmentVerified {
+                    job,
+                    assignment,
+                    range,
+                    connection,
+                    sample: sample(range.len(), 1000, 0),
+                    connection_reusable: true,
+                },
+                now + Duration::from_secs(1),
+            ));
+        }
+    }
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::StartAssignment { .. }))
+    );
+    assert!(actions.iter().all(
+        |a| !matches!(a, Action::StartAssignment { connection, .. } if *connection == retiring)
+    ));
+    assert_eq!(c.in_flight_on(retiring), 1);
+    let (assignment, range) = drained[3];
+    let actions = c.handle(
+        Observation::AssignmentVerified {
+            job,
+            assignment,
+            range,
+            connection: retiring,
+            sample: sample(range.len(), 1000, 0),
+            connection_reusable: true,
+        },
+        now + Duration::from_secs(2),
+    );
+    assert!(
+        actions.iter().any(
+            |a| matches!(a, Action::CloseConnection { connection } if *connection == retiring)
+        )
+    );
+    assert_eq!(c.reserved_connections(), 2);
+    c.handle(
+        Observation::ConnectionGone {
+            connection: retiring,
+        },
+        now + Duration::from_secs(2),
+    );
+    assert_eq!(c.reserved_connections(), 1);
+    assert!(
+        c.world.jobs[job]
+            .plan
+            .as_ref()
+            .unwrap()
+            .iter_assignments()
+            .all(|(_, a)| a.connection == Some(retained))
+    );
+}
+
+#[test]
+fn cooled_origin_handoff_refreshes_multiplexed_capacity_before_the_first_claim() {
+    let mut c = Controller::new();
+    c.limits.max_physical_connections = 1;
+    let now = Instant::now();
+    let mut s = spec("http://handoff.test/a");
+    s.policy.topology = crate::TopologyPolicy::Fixed(crate::Topology::new(1, 4));
+    let donor = admit(&mut c, s.clone(), "donor", now);
+    let (_, connection) = drive_to_transfer(&mut c, donor, now, crate::Protocol::Http2, 16 << 10);
+    let (assignment, range) = active_assignment(&c, donor);
+    let recipient = admit(&mut c, s, "recipient", now);
+    force_transferring(&mut c, recipient, 1 << 34);
+    let origin = c.world.jobs[recipient].origin;
+    c.world.origins[origin].cooldown_until = Some(now + Duration::from_secs(60));
+    c.handle(
+        Observation::AssignmentVerified {
+            job: donor,
+            assignment,
+            range,
+            connection,
+            sample: sample(range.len(), 10, 0),
+            connection_reusable: true,
+        },
+        now,
+    );
+    assert_eq!(c.world.connections[connection].owner, Some(recipient));
+    assert_eq!(c.world.jobs[recipient].grant.assignments, 4);
+    assert_eq!(
+        c.world.jobs[recipient].plan.as_ref().unwrap().in_flight(),
+        4
+    );
+}
+
 fn spec(url: &str) -> JobSpec {
     JobSpec::new(Url::parse(url).unwrap())
 }
 
 fn admit(c: &mut Controller, s: JobSpec, key: &str, now: Instant) -> JobId {
-    let (job, _) = c
+    let job = c
         .world
         .admit_job(&s, crate::core::world::DestinationKey::File(key.into()))
         .expect("admission succeeds");
@@ -150,8 +504,10 @@ fn commit_acknowledgement_cannot_complete_a_transferring_job() {
     assert!(actions.is_empty());
     assert_eq!(c.world.jobs[job].phase, JobPhase::Transferring);
     assert_eq!(
-        c.world.destinations[c.world.jobs[job].destination].leased_by,
-        Some(job)
+        c.world
+            .destination_leases
+            .get(&c.world.jobs[job].destination),
+        Some(&job)
     );
 }
 
@@ -168,9 +524,9 @@ fn cancelled_last_writer_cannot_start_a_commit() {
         1024,
     );
     let (assignment, range) = active_assignment(&c, job);
-    let destination = c.world.jobs[job].destination;
+    let destination = c.world.jobs[job].destination.clone();
     c.handle(Observation::JobCancelled { job }, now);
-    assert_eq!(c.world.destinations[destination].leased_by, Some(job));
+    assert_eq!(c.world.destination_leases.get(&destination), Some(&job));
     let actions = c.handle(
         Observation::AssignmentVerified {
             job,
@@ -193,7 +549,8 @@ fn cancelled_last_writer_cannot_start_a_commit() {
         a,
         Action::CommitDestination { .. } | Action::CompleteJob { .. }
     )));
-    assert_eq!(c.world.destinations[destination].leased_by, None);
+    assert!(!c.world.destination_leases.contains_key(&destination));
+    assert!(c.world.sources.is_empty());
     assert_eq!(c.active_assignment_count, 0);
 }
 
@@ -330,6 +687,8 @@ fn publication_owns_cancellation_once_commit_begins() {
             .count(),
         1
     );
+    assert!(c.world.sources.is_empty());
+    assert!(c.world.destination_leases.is_empty());
     assert!(
         c.handle(
             Observation::DestinationCommitted {
@@ -676,6 +1035,131 @@ fn cancellation_releases_the_destination_lease() {
 }
 
 #[test]
+fn terminal_jobs_release_source_metadata() {
+    let mut c = Controller::new();
+    let now = Instant::now();
+    for index in 0..32 {
+        let job = admit(
+            &mut c,
+            spec(&format!("https://example.test/{index}")),
+            &format!("out{index}"),
+            now,
+        );
+        assert_eq!(c.world.sources.len(), 1);
+        c.handle(Observation::JobCancelled { job }, now);
+        assert!(c.world.jobs.is_empty());
+        assert!(c.world.destination_leases.is_empty());
+        assert!(
+            c.world.sources.is_empty(),
+            "terminal job retained its sources"
+        );
+    }
+    assert_eq!(
+        c.world.origins.len(),
+        1,
+        "origin knowledge remains reusable"
+    );
+}
+
+#[test]
+fn cancelling_a_primary_probe_closes_it_before_connection_handoff() {
+    let mut c = Controller::new();
+    c.limits.max_physical_connections = 1;
+    c.limits.max_connections_per_origin = 1;
+    let now = Instant::now();
+    let job = admit(&mut c, spec("https://example.test/a"), "out", now);
+    let origin = c.world.jobs[job].origin;
+    c.handle(
+        Observation::Resolved {
+            origin,
+            endpoints: vec!["127.0.0.1:8080".parse().unwrap()],
+            failed: false,
+            https_records: Vec::new(),
+            from_cache: false,
+        },
+        now,
+    );
+    let connection = c.world.connections.keys().next().unwrap();
+    c.handle(
+        Observation::ConnectionReady {
+            connection,
+            protocol: crate::Protocol::Http2,
+            handshake: Duration::from_millis(5),
+        },
+        now,
+    );
+    assert_eq!(c.world.jobs[job].phase, JobPhase::Probing);
+    let peer = admit(&mut c, spec("https://example.test/b"), "peer", now);
+    let actions = c.handle(Observation::JobCancelled { job }, now);
+    assert!(
+        actions.iter().any(|a| matches!(a,
+            Action::CloseConnection { connection: closed } if *closed == connection
+        )),
+        "live probe was handed off: {actions:?}"
+    );
+    assert!(!c.world.connections.contains_key(connection));
+    assert_eq!(c.world.jobs[peer].total_length, None);
+}
+
+#[test]
+fn retired_control_results_cannot_mutate_a_new_job_or_lease() {
+    let mut c = Controller::new();
+    let now = Instant::now();
+    let job = admit(&mut c, spec("https://example.test/a"), "out", now);
+    let (_, connection) = drive_to_transfer(&mut c, job, now, crate::Protocol::Http2, 1024);
+    let source = c.world.jobs[job].sources[0];
+    let (assignment, range) = active_assignment(&c, job);
+    c.handle(Observation::JobCancelled { job }, now);
+    c.handle(
+        Observation::AssignmentVerified {
+            job,
+            assignment,
+            range,
+            sample: sample(range.len(), 10, 0),
+            connection,
+            connection_reusable: true,
+        },
+        now,
+    );
+    let replacement = admit(&mut c, spec("https://example.test/b"), "out", now);
+    let fresh_source = c.world.jobs[replacement].sources[0];
+    assert_ne!(job, replacement);
+    assert_ne!(source, fresh_source);
+    for observation in [
+        Observation::Probed {
+            job,
+            connection,
+            source,
+            supports_ranges: true,
+            total_length: Some(2048),
+            etag: None,
+            last_modified: None,
+            reusable: true,
+            alt_svc_h3: None,
+        },
+        Observation::MirrorSampled {
+            job,
+            source,
+            connection,
+            matches: true,
+            reusable: true,
+        },
+        Observation::JobCancelled { job },
+    ] {
+        c.handle(observation, now);
+        assert_eq!(c.world.sources.len(), 1);
+        assert_eq!(c.world.jobs[replacement].sources, vec![fresh_source]);
+        assert_eq!(c.world.jobs[replacement].total_length, None);
+        assert_eq!(
+            c.world
+                .destination_leases
+                .get(&c.world.jobs[replacement].destination),
+            Some(&replacement)
+        );
+    }
+}
+
+#[test]
 fn deadline_fails_only_the_named_job() {
     let mut c = Controller::new();
     let now = Instant::now();
@@ -708,7 +1192,7 @@ fn second_job_on_resolved_origin_gets_a_probe() {
         8 << 20,
     );
     let sb = spec("https://shared.test/b.bin");
-    let (b, _) = c
+    let b = c
         .world
         .admit_job(&sb, crate::core::world::DestinationKey::File("kb".into()))
         .expect("second job admits");
@@ -1245,7 +1729,14 @@ fn adaptive_windows_wait_for_retired_topology_to_drain(#[case] topology: crate::
     );
     assert_eq!(
         plan.iter_assignments().filter(|(_, a)| a.truncated).count(),
-        1
+        0
+    );
+    assert!(
+        plan.iter_assignments().all(|(_, a)| a
+            .control
+            .end
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == a.range.end)
     );
     for step in 1..20 {
         for (_, assignment) in c.world.jobs[job].plan.as_ref().unwrap().iter_assignments() {
@@ -1261,6 +1752,39 @@ fn adaptive_windows_wait_for_retired_topology_to_drain(#[case] topology: crate::
         c.world.jobs[job].planner.desired(),
         crate::Topology::new(1, 1)
     );
+    let assignments: Vec<_> = c.world.jobs[job]
+        .plan
+        .as_ref()
+        .unwrap()
+        .iter_assignments()
+        .map(|(id, a)| (c.assignment_ref(job, id), a.connection.unwrap(), a.range))
+        .collect();
+    for (index, (assignment, connection, range)) in assignments.into_iter().enumerate() {
+        let actions = c.handle(
+            Observation::AssignmentVerified {
+                job,
+                assignment,
+                connection,
+                range,
+                sample: sample(range.len(), 1000, 0),
+                connection_reusable: true,
+            },
+            now + Duration::from_secs(15),
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::TruncateAssignment { .. }))
+        );
+        if index == 0 {
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::StartAssignment { .. }))
+            );
+        }
+        assert_eq!(c.world.jobs[job].plan.as_ref().unwrap().in_flight(), 1);
+    }
 }
 
 #[rstest::rstest]

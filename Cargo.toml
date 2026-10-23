@@ -40,6 +40,7 @@ h3 = "0.0.8"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs"] }
 
 # transport
+getifs = "0.7"
 socket2 = { version = "0.6", features = ["all"] }
 rustix = { version = "1", features = ["fs", "std"] }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

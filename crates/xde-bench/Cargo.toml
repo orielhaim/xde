@@ -8,6 +8,12 @@ publish = false
 
 [dependencies]
 compio.workspace = true
+compio-quic.workspace = true
+bytes.workspace = true
+h3.workspace = true
+http.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 futures-util.workspace = true
 xde = { path = "../xde", features = ["diagnostics"] }
 xde-test = { path = "../xde-test" }
@@ -19,7 +25,7 @@ blake3.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus"] }
 
 [build-dependencies]
 blake3.workspace = true

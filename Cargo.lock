@@ -317,9 +317,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.9.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877bf67ac8e52449eb2f9e98a344ea163beb70dd1f9eebe3cc5357dcfeaee4df"
+checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -1094,9 +1094,9 @@ dependencies = [
 
 [[package]]
 name = "getifs"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa6e6a0cbb0aa38784226ac6aa9a8ddaf7683f0f6de05c699487de1cd30cae88"
+checksum = "0a0d3e16cebd3b1717161e49422252db21f0f60158f14b36a99d52bae67bd8b9"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -1106,11 +1106,10 @@ dependencies = [
  "iprobe",
  "libc",
  "linux-raw-sys",
- "paste",
+ "pastey",
  "rustix",
  "smallvec-wrapper",
  "smol_str",
- "triomphe",
  "widestring",
  "windows-sys 0.61.2",
 ]
@@ -1194,11 +1193,11 @@ dependencies = [
 
 [[package]]
 name = "hardware-address"
-version = "0.3.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12579d20f6036b21016ca703197f69ba898a5a7d6db7fd7264d2cfcb3abd5dbb"
+checksum = "50a8bfffa92827dbbdd8bcccb0d4ee4af66d124f4855e0091c69d899bb41f9a2"
 dependencies = [
- "paste",
+ "pastey",
  "thiserror",
 ]
 
@@ -1558,20 +1557,21 @@ dependencies = [
 
 [[package]]
 name = "iprfc"
-version = "0.2.3"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef9ffeec22969abcddea4070ffeffa22307f56e228063c26a9296c9a5e4bb9e2"
+checksum = "29ab9fb3724c3be005a8bf66c373ed1d6438f770e04008dccd136cbd446dbb8b"
 dependencies = [
  "bitflags",
  "ipnet",
- "paste",
+ "pastey",
+ "serde",
 ]
 
 [[package]]
 name = "iprobe"
-version = "0.1.2"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bd62ac914a5bf1539c0219670a907f222ad4b25214c853e4525e25efd272517"
+checksum = "749bb1999d367058cd5249b10198331b66d9e7636ec65d2548ea1029b6fa335e"
 dependencies = [
  "rustix",
 ]
@@ -3026,16 +3026,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "triomphe"
-version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d15f4f5898bcfc5d8a8e45ed30b2f108d710c1a2e5489dbf80e078f707181bc"
-dependencies = [
- "serde",
- "stable_deref_trait",
-]
-
-[[package]]
 name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3227,9 +3217,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.10"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
+checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -3452,9 +3442,15 @@ name = "xde-bench"
 version = "0.2.0"
 dependencies = [
  "blake3",
+ "bytes",
  "clap",
  "compio",
+ "compio-quic",
  "futures-util",
+ "h3",
+ "http",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

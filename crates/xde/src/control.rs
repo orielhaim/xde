@@ -569,7 +569,7 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
         .world
         .admit_job(&spec, cmd.destination_key.clone())
     {
-        Ok((job, _artifact)) => job,
+        Ok(job) => job,
         Err(e) => {
             let msg = match &e {
                 crate::core::world::DestinationLeaseError::Busy(k) => {
@@ -584,16 +584,6 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
             return;
         }
     };
-    if let Err(e) = lp.controller.world.set_destination_part_path(
-        job,
-        coordinator.as_ref().map(|c| c.part_path().to_path_buf()),
-    ) {
-        let msg = e.to_string();
-        let _ = cmd.admit_tx.send(Err(e));
-        let _ = cmd.result_tx.send(Err(Error::destination(msg)));
-        return;
-    }
-
     let part_path = coordinator
         .as_ref()
         .map(|c| c.part_path().to_path_buf())

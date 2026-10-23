@@ -10,13 +10,42 @@ pub struct ResourceGrant {
     pub assignments: u16,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentCapacity {
+    /// Discovery needs one admission slot before a connection is ready.
+    Control,
+    Transfer {
+        serial: u16,
+        multiplexed: u16,
+        streams: u16,
+    },
+}
+impl AssignmentCapacity {
+    pub fn slots(self, connections: u16) -> u16 {
+        match self {
+            Self::Control => u16::from(connections > 0),
+            Self::Transfer {
+                serial,
+                multiplexed,
+                streams,
+            } => {
+                let multiplexed = multiplexed.min(connections);
+                (u32::from(multiplexed) * u32::from(streams)
+                    + u32::from(serial.min(connections - multiplexed)))
+                .min(u32::from(u16::MAX)) as u16
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Demand {
     pub job: JobId,
     pub order: u64,
     pub origin: OriginId,
     pub connections: u16,
     pub assignments: u16,
+    pub capacity: AssignmentCapacity,
     pub weight: f64,
     pub service: f64,
     pub active: bool,
@@ -36,87 +65,94 @@ pub fn allocate(demand: &[Demand], limits: EngineLimits) -> Vec<(JobId, Resource
         });
         eligible.truncate(max_active_jobs.get());
     }
+    if let [d] = eligible.as_slice() {
+        let connections = d
+            .connections
+            .min(limits.max_physical_connections)
+            .min(limits.max_connections_per_origin);
+        let assignments = if connections > 0 {
+            u32::from(d.assignments.min(d.capacity.slots(connections)))
+                .min(limits.max_active_assignments) as u16
+        } else {
+            0
+        };
+        return vec![(
+            d.job,
+            ResourceGrant {
+                connections,
+                assignments,
+            },
+        )];
+    }
     let mut grants = vec![ResourceGrant::default(); eligible.len()];
+    let mut origin_ids = slotmap::SecondaryMap::<OriginId, usize>::new();
+    let mut origin_used = Vec::new();
+    let origins: Vec<_> = eligible
+        .iter()
+        .map(|d| {
+            *origin_ids.entry(d.origin).unwrap().or_insert_with(|| {
+                origin_used.push(0u32);
+                origin_used.len() - 1
+            })
+        })
+        .collect();
     for connection in [true, false] {
         let budget = if connection {
             u32::from(limits.max_physical_connections)
         } else {
             limits.max_active_assignments
         };
-        for _ in 0..budget {
-            let selected = eligible
+        let want = |i: usize| {
+            if connection {
+                eligible[i].connections
+            } else if grants[i].connections > 0 {
+                eligible[i]
+                    .assignments
+                    .min(eligible[i].capacity.slots(grants[i].connections))
+            } else {
+                0
+            }
+        };
+        let mut queue = std::collections::BinaryHeap::from(
+            eligible
                 .iter()
                 .enumerate()
-                .filter(|(i, d)| {
-                    let g = grants[*i];
-                    let used = if connection {
-                        g.connections
-                    } else {
-                        g.assignments
-                    };
-                    let want = if connection {
-                        d.connections
-                    } else {
-                        d.assignments
-                    };
-                    if used >= want || (!connection && g.connections == 0) {
-                        return false;
-                    }
-                    !connection
-                        || eligible
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, peer)| peer.origin == d.origin)
-                            .map(|(n, _)| u32::from(grants[n].connections))
-                            .sum::<u32>()
-                            < u32::from(limits.max_connections_per_origin)
-                })
-                .min_by(|(i, a), (j, b)| {
-                    let used = |n: usize| {
-                        if connection {
-                            grants[n].connections
-                        } else {
-                            grants[n].assignments
-                        }
-                    };
-                    let x = used(*i);
-                    let y = used(*j);
-                    // Give every runnable job an opportunity before increasing parallelism.
-                    (x != 0)
-                        .cmp(&(y != 0))
-                        .then_with(|| {
-                            if x == 0 && y == 0 {
-                                a.service.total_cmp(&b.service)
-                            } else {
-                                let score = |used: u16, d: &Demand| {
-                                    let elasticity =
-                                        if matches!(limits.scheduling, SchedulingPolicy::FairShare)
-                                        {
-                                            if connection {
-                                                d.productivity.connections
-                                            } else {
-                                                d.productivity.assignments
-                                            }
-                                        } else {
-                                            0.0
-                                        };
-                                    // d log(n * goodput(n))/dn = (1 + elasticity)/n.
-                                    f64::from(used) / d.weight / (1.0 + elasticity)
-                                };
-                                score(x, a).total_cmp(&score(y, b))
-                            }
-                        })
-                        .then_with(|| a.service.total_cmp(&b.service))
-                        .then(a.order.cmp(&b.order))
-                })
-                .map(|(i, _)| i);
-            let Some(i) = selected else {
-                break;
-            };
-            if connection {
+                .filter(|(i, _)| want(*i) > 0)
+                .map(|(i, d)| Candidate::new(i, 0, d, connection, limits.scheduling))
+                .collect::<Vec<_>>(),
+        );
+        let mut allocated = 0;
+        while allocated < budget {
+            let Some(candidate) = queue.pop() else { break };
+            let i = candidate.index;
+            if connection && origin_used[origins[i]] >= u32::from(limits.max_connections_per_origin)
+            {
+                continue;
+            }
+            let used = if connection {
+                origin_used[origins[i]] += 1;
                 grants[i].connections += 1;
+                grants[i].connections
             } else {
                 grants[i].assignments += 1;
+                grants[i].assignments
+            };
+            allocated += 1;
+            let target = if connection {
+                eligible[i].connections
+            } else {
+                eligible[i]
+                    .assignments
+                    .min(eligible[i].capacity.slots(grants[i].connections))
+            };
+            if used < target {
+                queue.push(Candidate::new(
+                    i,
+                    used,
+                    eligible[i],
+                    connection,
+                    limits.scheduling,
+                ));
             }
         }
     }
@@ -126,6 +162,62 @@ pub fn allocate(demand: &[Demand], limits: EngineLimits) -> Vec<(JobId, Resource
         .map(|(d, g)| (d.job, g))
         .collect()
 }
+
+#[derive(Debug)]
+struct Candidate {
+    index: usize,
+    used: u16,
+    score: f64,
+    service: f64,
+    order: u64,
+}
+impl Candidate {
+    fn new(
+        index: usize,
+        used: u16,
+        d: &Demand,
+        connection: bool,
+        policy: SchedulingPolicy,
+    ) -> Self {
+        let elasticity = if matches!(policy, SchedulingPolicy::FairShare) {
+            if connection {
+                d.productivity.connections
+            } else {
+                d.productivity.assignments
+            }
+        } else {
+            0.0
+        };
+        Self {
+            index,
+            used,
+            score: f64::from(used) / d.weight / (1.0 + elasticity),
+            service: d.service,
+            order: d.order,
+        }
+    }
+}
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (other.used != 0)
+            .cmp(&(self.used != 0))
+            .then_with(|| other.score.total_cmp(&self.score))
+            .then_with(|| other.service.total_cmp(&self.service))
+            .then(other.order.cmp(&self.order))
+            .then(other.index.cmp(&self.index))
+    }
+}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Candidate {}
 
 #[cfg(test)]
 mod tests {
@@ -144,6 +236,11 @@ mod tests {
                 origin: if shared { origin } else { origins.insert(()) },
                 connections: 8,
                 assignments: 8,
+                capacity: AssignmentCapacity::Transfer {
+                    serial: 0,
+                    multiplexed: 8,
+                    streams: 8,
+                },
                 weight: 1.0,
                 service: 0.0,
                 active: false,
@@ -215,6 +312,39 @@ mod tests {
             .map(|n| utility(f64::from(n)))
             .fold(f64::NEG_INFINITY, f64::max);
         assert!((utility(3.0) - oracle).abs() < 1e-12);
+    }
+
+    #[rstest::rstest]
+    #[case(4, 7)]
+    #[case(2, 5)]
+    #[case(1, 4)]
+    fn mixed_capacity_is_limited_by_granted_physical_connections(
+        #[case] physical: u16,
+        #[case] slots: u16,
+    ) {
+        let mut demand = jobs(1, true);
+        demand[0].connections = 4;
+        demand[0].assignments = 16;
+        demand[0].capacity = AssignmentCapacity::Transfer {
+            serial: 3,
+            multiplexed: 1,
+            streams: 4,
+        };
+        let mut cap = limits(physical);
+        cap.max_active_assignments = 32;
+        assert_eq!(
+            allocate(&demand, cap)[0].1,
+            ResourceGrant {
+                connections: physical,
+                assignments: slots
+            }
+        );
+        demand[0].capacity = AssignmentCapacity::Transfer {
+            serial: 4,
+            multiplexed: 0,
+            streams: 4,
+        };
+        assert_eq!(allocate(&demand, cap)[0].1.assignments, physical);
     }
 
     #[test]

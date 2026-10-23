@@ -1,5 +1,5 @@
 function Invoke-BenchmarkProcess {
-    param([string]$Executable, [string[]]$Arguments, [string]$OutputPath, [int]$TimeoutSeconds = 180)
+    param([string]$Executable, [string[]]$Arguments, [string]$OutputPath, [int]$TimeoutSeconds = 180, [long]$ProcessorAffinity = 0)
     $info = [System.Diagnostics.ProcessStartInfo]::new((Resolve-Path -LiteralPath $Executable).Path)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
@@ -12,6 +12,19 @@ function Invoke-BenchmarkProcess {
         $null = $process.Start()
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
+        if ($ProcessorAffinity) {
+            try {
+                $process.ProcessorAffinity = [IntPtr]::new($ProcessorAffinity)
+                $actual = $process.ProcessorAffinity.ToInt64()
+                if ($actual -ne $ProcessorAffinity) {throw 'Affinity readback mismatch'}
+                @{pid=$process.Id;requested_affinity=$ProcessorAffinity;actual_affinity=$actual;priority_class="$($process.PriorityClass)";diagnostic_only=$true;applied_utc=[DateTime]::UtcNow.ToString('o')} |
+                    ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath "$OutputPath.affinity"
+            } catch {
+                $process.Kill($true)
+                $process.WaitForExit()
+                throw
+            }
+        }
         $finished = $process.WaitForExit($TimeoutSeconds * 1000)
         if (!$finished) { $process.Kill($true); $process.WaitForExit() }
         $stdout.GetAwaiter().GetResult() | Set-Content -LiteralPath $OutputPath -Encoding utf8

@@ -32,8 +32,8 @@ pub mod world;
 pub use disposition::Disposition;
 pub use error::{Error, Result, RuntimeError};
 pub use ids::{
-    ArtifactId, AssignId, AssignmentRef, ConnectionId, DestinationId, EndpointId, JobId,
-    NetworkContextId, OriginId, PathId, SessionId, SourceId, StreamId,
+    AssignId, AssignmentRef, ConnectionId, EndpointId, JobId, NetworkContextId, OriginId, PathId,
+    SessionId, SourceId, StreamId,
 };
 pub use provenance::ArtifactProvenance;
 pub use ranges::{ByteRange, RangeSet};

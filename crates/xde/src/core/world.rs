@@ -19,8 +19,8 @@ use slotmap::{DenseSlotMap, SecondaryMap, SlotMap};
 
 use crate::core::{
     ids::{
-        ArtifactId, ConnectionId, DestinationId, EndpointId, JobId, NetworkContextId, OriginId,
-        PathId, SourceId, TransportOriginKey,
+        ConnectionId, EndpointId, JobId, NetworkContextId, OriginId, PathId, SourceId,
+        TransportOriginKey,
     },
     policy::TransferPolicy,
     representation::RepresentationLock,
@@ -112,7 +112,6 @@ impl From<&str> for JobFailure {
 pub struct JobNode {
     pub id: JobId,
     pub admission_order: u64,
-    pub artifact: ArtifactId,
     /// Every source that can serve this artifact, in application-declared
     /// preference order. One artifact, many sources.
     pub sources: Vec<SourceId>,
@@ -121,7 +120,7 @@ pub struct JobNode {
     /// equivalence only) and leave when quarantined.
     pub active_sources: Vec<SourceId>,
     pub origin: OriginId,
-    pub destination: DestinationId,
+    pub destination: DestinationKey,
     pub phase: JobPhase,
     pub priority: Priority,
     pub urgency: Urgency,
@@ -363,15 +362,9 @@ const MAX_SAMPLES_PER_ENDPOINT: usize = 8;
 const SAMPLE_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug)]
-pub struct ArtifactNode {
-    pub expected_length: Option<u64>,
-}
-
-#[derive(Debug)]
 pub struct SourceNode {
-    pub artifact: ArtifactId,
     pub url: String,
-    /// Headers that can change the answer (never credentials).
+    /// Request headers, retained only for the admitted job lifetime.
     pub headers: http::HeaderMap,
     pub header_identity: [u8; 32],
     pub origin: OriginId,
@@ -393,13 +386,6 @@ impl std::fmt::Display for DestinationKey {
     }
 }
 
-#[derive(Debug)]
-pub struct DestinationNode {
-    pub key: DestinationKey,
-    /// Job currently holding the exclusive lease, if any.
-    pub leased_by: Option<JobId>,
-}
-
 /// Single source of truth for engine entities and their relationships.
 ///
 /// Invariants (checked by `assert_invariants`, enabled in debug builds):
@@ -410,7 +396,6 @@ pub struct DestinationNode {
 #[derive(Debug, Default)]
 pub struct WorldModel {
     pub jobs: DenseSlotMap<JobId, JobNode>,
-    pub artifacts: SlotMap<ArtifactId, ArtifactNode>,
     pub sources: SlotMap<SourceId, SourceNode>,
     pub origins: SlotMap<OriginId, OriginNode>,
     pub endpoints: SlotMap<EndpointId, EndpointNode>,
@@ -421,8 +406,7 @@ pub struct WorldModel {
     pub network_contexts: SlotMap<NetworkContextId, NetworkContextKey>,
     /// The context the engine currently operates in.
     pub current_context: Option<NetworkContextId>,
-    pub destinations: SlotMap<DestinationId, DestinationNode>,
-    pub destination_index: HashMap<DestinationKey, DestinationId>,
+    pub destination_leases: HashMap<DestinationKey, JobId>,
     pub origin_index: HashMap<TransportOriginKey, OriginId>,
     next_job_order: u64,
     pending_learning: Option<crate::core::profile::PersistedProfile>,
@@ -437,51 +421,23 @@ impl WorldModel {
     // Admission
     // ---------------------------------------------------------------
 
-    /// Admit a job: allocate artifact/source/origin, acquire the destination
-    /// lease. Returns Err(DestinationError) on lease conflict so the caller
-    /// can fail the job before any I/O happens.
+    /// Acquire the destination lease and create job-owned sources before I/O.
     pub fn admit_job(
         &mut self,
         spec: &JobSpec,
         destination_key: DestinationKey,
-    ) -> Result<(JobId, ArtifactId), DestinationLeaseError> {
-        let dest_id = match self.destination_index.get(&destination_key) {
-            Some(&id) => {
-                let node = self
-                    .destinations
-                    .get_mut(id)
-                    .expect("index points into slotmap");
-                if node.leased_by.is_some() {
-                    return Err(DestinationLeaseError::Busy(destination_key));
-                }
-                id
-            }
-            None => {
-                let id = self.destinations.insert(DestinationNode {
-                    key: destination_key.clone(),
-                    leased_by: None,
-                });
-                self.destination_index.insert(destination_key.clone(), id);
-                id
-            }
-        };
-
+    ) -> Result<JobId, DestinationLeaseError> {
+        if self.destination_leases.contains_key(&destination_key) {
+            return Err(DestinationLeaseError::Busy(destination_key));
+        }
         if spec.sources.is_empty() {
             return Err(DestinationLeaseError::NoSource);
         }
-        let artifact = self.artifacts.insert(ArtifactNode {
-            expected_length: None,
-        });
-
-        // One artifact, many sources: every declared source gets a node,
-        // all pointing at the same artifact. Origins are shared when
-        // mirrors resolve to the same host.
         let mut source_ids = Vec::with_capacity(spec.sources.len());
         let mut primary_origin = None;
         for src in &spec.sources {
             let origin_id = self.get_or_create_origin(src.origin_key());
             let source_id = self.sources.insert(SourceNode {
-                artifact, // known above; no patching needed
                 url: src.url.to_string(),
                 headers: src.headers.clone(),
                 header_identity: src.representation_fingerprint(),
@@ -499,11 +455,10 @@ impl WorldModel {
         let job = self.jobs.insert_with_key(|id| JobNode {
             admission_order,
             id,
-            artifact,
             active_sources: vec![source_ids[0]],
             sources: source_ids,
             origin: origin_id,
-            destination: dest_id,
+            destination: destination_key.clone(),
             phase: JobPhase::Created,
             priority: spec.priority,
             urgency: spec.urgency,
@@ -543,37 +498,8 @@ impl WorldModel {
             sample_wall: Duration::ZERO,
         });
 
-        if let Some(d) = self.destinations.get_mut(dest_id) {
-            d.leased_by = Some(job);
-        }
-
-        Ok((job, artifact))
-    }
-
-    pub fn release_destination(&mut self, job: JobId) {
-        let dest = self.jobs.get(job).map(|j| j.destination);
-        if let Some(dest) = dest
-            && let Some(d) = self.destinations.get_mut(dest)
-            && d.leased_by == Some(job)
-        {
-            d.leased_by = None;
-        }
-    }
-
-    /// Record where this job's `.part` lives so fetch commands can carry it.
-    /// Returns an error only if the job does not exist.
-    pub fn set_destination_part_path(
-        &mut self,
-        job: JobId,
-        _path: Option<std::path::PathBuf>,
-    ) -> Result<(), crate::core::Error> {
-        if self.jobs.contains_key(job) {
-            Ok(())
-        } else {
-            Err(crate::core::Error::Config(
-                "job vanished during admission".into(),
-            ))
-        }
+        self.destination_leases.insert(destination_key, job);
+        Ok(job)
     }
 
     /// Record what the job's destination can do. Called at admission for
@@ -1080,11 +1006,7 @@ impl WorldModel {
 
     pub fn assert_invariants(&self) {
         for (_, job) in self.jobs.iter() {
-            debug_assert!(
-                self.destinations.contains_key(job.destination),
-                "job points at missing destination"
-            );
-            debug_assert!(self.artifacts.contains_key(job.artifact));
+            debug_assert_eq!(self.destination_leases.get(&job.destination), Some(&job.id));
             debug_assert!(job.sources.iter().all(|s| self.sources.contains_key(*s)));
             if let Some(plan) = &job.plan
                 && let Some(total) = plan.total()
@@ -1092,20 +1014,12 @@ impl WorldModel {
                 debug_assert!(plan.completed().covered_len() <= total);
             }
         }
-        // At most one active job per destination lease.
-        for (dest_id, dest) in self.destinations.iter() {
-            let holders: Vec<_> = self
-                .jobs
-                .iter()
-                .filter(|(_, j)| j.destination == dest_id)
-                .collect();
-            if dest.leased_by.is_some() || !holders.is_empty() {
-                debug_assert!(
-                    holders.len() <= 1,
-                    "more than one job holds lease on {}",
-                    dest.key
-                );
-            }
+        for (destination, owner) in &self.destination_leases {
+            debug_assert!(
+                self.jobs
+                    .get(*owner)
+                    .is_some_and(|j| &j.destination == destination)
+            );
         }
         // Every connection belongs to exactly one origin list.
         for (_, conn) in self.connections.iter() {

@@ -539,6 +539,7 @@ pub struct Controller {
     epoch: Instant,
     limits: crate::core::policy::EngineLimits,
     contended: bool,
+    grant_demand: Option<Vec<crate::core::allocator::Demand>>,
     active_assignment_count: usize,
     shard_load: Vec<usize>,
     connection_state: slotmap::SecondaryMap<ConnectionId, ConnectionRuntimeState>,
@@ -570,6 +571,7 @@ impl Controller {
             },
             limits: Default::default(),
             contended: false,
+            grant_demand: None,
             retry: RetryPolicy::default(),
             epoch: Instant::now(),
             active_assignment_count: 0,
@@ -583,6 +585,7 @@ impl Controller {
     /// control plane).
     pub fn set_engine_limits(&mut self, limits: &crate::core::policy::EngineLimits) {
         self.limits = *limits;
+        self.grant_demand = None;
     }
 
     pub fn max_jobs(&self) -> usize {
@@ -590,8 +593,24 @@ impl Controller {
     }
 
     fn refresh_grants(&mut self, now: Instant) {
-        self.stats.allocation_passes += 1;
-        use crate::core::allocator::{Demand, ResourceGrant, allocate};
+        use crate::core::allocator::{AssignmentCapacity, Demand, ResourceGrant, allocate};
+        let mut ready = slotmap::SecondaryMap::<JobId, (u16, u16)>::new();
+        for c in self.world.connections.values() {
+            if c.status == ConnectionStatus::Ready
+                && let Some(owner) = c.owner
+                && let Some(j) = self.world.jobs.get(owner)
+                && Self::protocol_allowed(&j.policy, c.protocol)
+                && c.serving_source
+                    .is_none_or(|source| j.active_sources.contains(&source))
+            {
+                let counts = ready.entry(owner).unwrap().or_insert((0, 0));
+                if c.protocol == crate::Protocol::Http1_1 {
+                    counts.0 += 1;
+                } else {
+                    counts.1 += 1;
+                }
+            }
+        }
         let demand: Vec<_> = self
             .world
             .jobs
@@ -607,11 +626,7 @@ impl Controller {
             })
             .map(|(job, j)| {
                 let target = j.planner.desired();
-                let multiplexed = self.world.connections.values().any(|c| {
-                    c.owner == Some(job)
-                        && c.status == ConnectionStatus::Ready
-                        && c.protocol != crate::core::events::Protocol::Http1_1
-                });
+                let (serial, multiplexed) = ready.get(job).copied().unwrap_or_default();
                 let segmented =
                     j.supports_ranges && crate::core::sink::supports_segmentation(j.sink_caps);
                 let connections = match j.phase {
@@ -619,17 +634,22 @@ impl Controller {
                     JobPhase::Transferring if segmented => u16::from(target.connections),
                     _ => 1,
                 };
+                let capacity = if segmented && serial + multiplexed > 0 {
+                    AssignmentCapacity::Transfer {
+                        serial,
+                        multiplexed,
+                        streams: target.streams_per_connection,
+                    }
+                } else {
+                    AssignmentCapacity::Control
+                };
                 let assignments = if connections == 0 {
                     0
                 } else if segmented {
-                    (u32::from(connections)
-                        * if multiplexed {
-                            u32::from(target.streams_per_connection)
-                        } else {
-                            1
-                        })
-                    .min(u32::from(j.policy.transport.max_active_assignments))
-                    .min(j.sink_hints.max_parallel_writes.max(1) as u32) as u16
+                    u32::from(capacity.slots(connections))
+                        .min(u32::from(j.policy.transport.max_active_assignments))
+                        .min(j.sink_hints.max_parallel_writes.max(1) as u32)
+                        as u16
                 } else {
                     1
                 };
@@ -639,6 +659,7 @@ impl Controller {
                     origin: j.origin,
                     connections,
                     assignments,
+                    capacity,
                     weight: j.priority.weight(),
                     service: j.virt_service
                         + j.plan
@@ -659,22 +680,26 @@ impl Controller {
                 }
             })
             .collect();
-        let grants = allocate(&demand, self.limits);
+        if self.grant_demand.as_deref() == Some(demand.as_slice()) {
+            return;
+        }
+        self.stats.allocation_passes += 1;
+        let mut grants = slotmap::SecondaryMap::new();
+        for (job, grant) in allocate(&demand, self.limits) {
+            grants.insert(job, grant);
+        }
         self.contended = demand.len() > 1
             && demand.iter().any(|d| {
-                let granted = grants
-                    .iter()
-                    .find(|(job, _)| *job == d.job)
-                    .map_or(ResourceGrant::default(), |(_, g)| *g);
+                let granted = grants.get(d.job).copied().unwrap_or_default();
                 granted.connections < d.connections || granted.assignments < d.assignments
             });
+        let mut requested = slotmap::SecondaryMap::new();
+        for d in &demand {
+            requested.insert(d.job, d);
+        }
         for (job, j) in self.world.jobs.iter_mut() {
-            let next = grants
-                .iter()
-                .find(|(id, _)| *id == job)
-                .map_or(ResourceGrant::default(), |(_, grant)| *grant);
-            let requested = demand.iter().find(|d| d.job == job);
-            if requested.is_some_and(|d| {
+            let next = grants.get(job).copied().unwrap_or(ResourceGrant::default());
+            if requested.get(job).is_some_and(|d| {
                 (next.connections < j.grant.connections && next.connections < d.connections)
                     || (next.assignments < j.grant.assignments && next.assignments < d.assignments)
             }) {
@@ -682,6 +707,7 @@ impl Controller {
             }
             j.grant = next;
         }
+        self.grant_demand = Some(demand);
     }
 
     fn reconcile(&mut self, actions: &mut Vec<Action>, now: Instant) {
@@ -700,53 +726,6 @@ impl Controller {
                             .start
                             .saturating_add(a.control.bytes())
                             .saturating_add(self.limits.fair_quantum_bytes);
-                        if end < a.range.end {
-                            a.control
-                                .end
-                                .fetch_min(end, std::sync::atomic::Ordering::Relaxed);
-                            a.truncated = true;
-                        }
-                    }
-                }
-            }
-        }
-        for (job, j) in self.world.jobs.iter_mut() {
-            let target = j.planner.desired();
-            if !j.planner.adaptive()
-                || !j.supports_ranges
-                || j.grant.connections < u16::from(target.connections)
-                || u32::from(j.grant.assignments)
-                    < target
-                        .slots()
-                        .min(u32::from(j.policy.transport.max_active_assignments))
-            {
-                continue;
-            }
-            let keep: Vec<_> = self
-                .world
-                .connections
-                .iter()
-                .filter(|(_, c)| c.owner == Some(job) && c.status == ConnectionStatus::Ready)
-                .take(usize::from(target.connections))
-                .map(|(id, _)| id)
-                .collect();
-            let mut slots = vec![0usize; keep.len()];
-            if let Some(plan) = j.plan.as_mut() {
-                for (_, a) in plan.iter_assignments_mut() {
-                    let retained = a
-                        .connection
-                        .and_then(|c| keep.iter().position(|id| *id == c))
-                        .is_some_and(|index| {
-                            slots[index] += 1;
-                            slots[index] <= usize::from(target.streams_per_connection)
-                        });
-                    if !retained {
-                        // Keep the range reservation until the sink acknowledges its actual end.
-                        let end = a
-                            .range
-                            .start
-                            .saturating_add(a.control.bytes())
-                            .saturating_add(j.policy.segmentation.min_piece);
                         if end < a.range.end {
                             a.control
                                 .end
@@ -776,6 +755,7 @@ impl Controller {
             })
             .map(|(id, _)| id)
             .collect();
+        let mut capacity_changed = false;
         for connection in idle {
             let c = &self.world.connections[connection];
             let Some(owner) = c.owner else {
@@ -790,6 +770,7 @@ impl Controller {
                 continue;
             }
             owned[owner] -= 1;
+            capacity_changed = true;
             let recipient = self
                 .world
                 .jobs
@@ -816,6 +797,9 @@ impl Controller {
                 actions.push(Action::CloseConnection { connection });
                 self.drop_connection(connection);
             }
+        }
+        if capacity_changed {
+            self.refresh_grants(now);
         }
         let activate: Vec<_> = self
             .world
@@ -985,22 +969,25 @@ impl Controller {
         let Some(j) = self.world.jobs.get(job) else {
             return false;
         };
-        let target = j.planner.desired();
+        let requested = self
+            .grant_demand
+            .as_ref()
+            .and_then(|demand| demand.iter().find(|d| d.job == job));
         let owned = self
             .reservations
             .values()
             .filter(|r| r.owner == job)
             .count();
-        j.grant.connections < u16::from(target.connections)
-            || j.grant.assignments == 0
-            || (owned < usize::from(j.grant.connections)
-                && (self.reservations.len() >= usize::from(self.limits.max_physical_connections)
-                    || self
-                        .reservations
-                        .values()
-                        .filter(|r| r.origin == j.origin)
-                        .count()
-                        >= usize::from(self.limits.max_connections_per_origin)))
+        requested.is_some_and(|d| {
+            j.grant.connections < d.connections || j.grant.assignments < d.assignments
+        }) || (owned < usize::from(j.grant.connections)
+            && (self.reservations.len() >= usize::from(self.limits.max_physical_connections)
+                || self
+                    .reservations
+                    .values()
+                    .filter(|r| r.origin == j.origin)
+                    .count()
+                    >= usize::from(self.limits.max_connections_per_origin)))
     }
 
     pub fn connection_shard(&self, connection: ConnectionId) -> Option<usize> {
@@ -1044,7 +1031,6 @@ impl Controller {
     }
 
     fn handle_reconciled(&mut self, obs: Observation, now: Instant) -> Vec<Action> {
-        self.refresh_grants(now);
         let control_result = match &obs {
             Observation::Probed {
                 job, connection, ..
@@ -1401,8 +1387,9 @@ impl Controller {
                     });
                     if let Some(job) = owner {
                         if self.world.jobs[job].active_sources.contains(&sid) {
-                            self.pump(&mut actions, origin, now);
-                        } else if self.world.jobs[job].probing_sources.contains(&sid) {
+                            return actions;
+                        }
+                        if self.world.jobs[job].probing_sources.contains(&sid) {
                             actions.push(Action::Probe {
                                 job,
                                 connection,
@@ -1446,7 +1433,6 @@ impl Controller {
                     return actions;
                 }
                 self.ensure_probes(&mut actions, origin, now);
-                self.pump(&mut actions, origin, now);
             }
 
             Observation::ConnectionFailed { connection, kind } => {
@@ -1584,138 +1570,126 @@ impl Controller {
                 assignment,
                 connection,
                 origin,
-            } => {
-                match operation {
-                    DispatchOperation::StartAssignment | DispatchOperation::StartFullBody => {
-                        if let Some(assign) = assignment {
-                            if !self.has_assignment(assign) {
-                                return actions;
-                            }
-                            self.release_assignment_slot(connection);
-                            self.handle_assignment_disposition(
-                                &mut actions,
-                                assign.job,
-                                Some(assign.assignment),
-                                ByteRange::new(0, 0),
-                                Disposition::RetrySameRange {
-                                    after: Some(Duration::ZERO),
-                                    reason: "assignment dispatch failed",
-                                },
-                                0,
-                                connection,
-                                now,
-                            );
+            } => match operation {
+                DispatchOperation::StartAssignment | DispatchOperation::StartFullBody => {
+                    if let Some(assign) = assignment {
+                        if !self.has_assignment(assign) {
+                            return actions;
                         }
+                        self.release_assignment_slot(connection);
+                        self.handle_assignment_disposition(
+                            &mut actions,
+                            assign.job,
+                            Some(assign.assignment),
+                            ByteRange::new(0, 0),
+                            Disposition::RetrySameRange {
+                                after: Some(Duration::ZERO),
+                                reason: "assignment dispatch failed",
+                            },
+                            0,
+                            connection,
+                            now,
+                        );
                     }
-                    DispatchOperation::TruncateAssignment => {
-                        if let Some(job) = job {
-                            self.begin_fail(
-                                &mut actions,
-                                job,
-                                "failed to stop an assignment during range rebalancing".into(),
-                            );
+                }
+                DispatchOperation::TruncateAssignment => {
+                    if let Some(job) = job {
+                        self.begin_fail(
+                            &mut actions,
+                            job,
+                            "failed to stop an assignment during range rebalancing".into(),
+                        );
+                    }
+                }
+                DispatchOperation::Probe | DispatchOperation::OpenConnection => {
+                    if let Some(conn) = connection {
+                        if operation == DispatchOperation::OpenConnection {
+                            self.reservations.remove(&conn);
+                        } else {
+                            actions.push(Action::CloseConnection { connection: conn });
                         }
-                    }
-                    DispatchOperation::Probe | DispatchOperation::OpenConnection => {
-                        if let Some(conn) = connection {
-                            if operation == DispatchOperation::OpenConnection {
-                                self.reservations.remove(&conn);
-                            } else {
-                                actions.push(Action::CloseConnection { connection: conn });
+                        let intent = self.world.connections.get(conn).map(|c| c.intent);
+                        self.drop_connection(conn);
+                        match intent {
+                            Some(crate::core::world::ConnectionIntent::Probe { job, .. }) => {
+                                self.retry_resolve(&mut actions, job, now);
                             }
-                            let intent = self.world.connections.get(conn).map(|c| c.intent);
-                            self.drop_connection(conn);
-                            match intent {
-                                Some(crate::core::world::ConnectionIntent::Probe {
-                                    job, ..
-                                }) => {
-                                    self.retry_resolve(&mut actions, job, now);
+                            Some(crate::core::world::ConnectionIntent::Mirror { job, source }) => {
+                                if let Some(j) = self.world.jobs.get_mut(job) {
+                                    j.probing_sources.retain(|s| *s != source);
+                                    j.failed_sources.push(source);
                                 }
-                                Some(crate::core::world::ConnectionIntent::Mirror {
-                                    job,
-                                    source,
-                                }) => {
-                                    if let Some(j) = self.world.jobs.get_mut(job) {
-                                        j.probing_sources.retain(|s| *s != source);
-                                        j.failed_sources.push(source);
-                                    }
-                                }
-                                _ => {}
                             }
-                        } else if let Some(job) = job {
+                            _ => {}
+                        }
+                    } else if let Some(job) = job {
+                        self.retry_resolve(&mut actions, job, now);
+                    } else if let Some(origin) = origin {
+                        let jobs: Vec<_> = self
+                            .world
+                            .jobs
+                            .iter()
+                            .filter(|(_, j)| j.origin == origin && j.phase == JobPhase::Probing)
+                            .map(|(id, _)| id)
+                            .collect();
+                        for job in jobs {
                             self.retry_resolve(&mut actions, job, now);
-                        } else if let Some(origin) = origin {
-                            let jobs: Vec<_> = self
-                                .world
-                                .jobs
-                                .iter()
-                                .filter(|(_, j)| j.origin == origin && j.phase == JobPhase::Probing)
-                                .map(|(id, _)| id)
-                                .collect();
-                            for job in jobs {
-                                self.retry_resolve(&mut actions, job, now);
-                            }
                         }
                     }
-                    DispatchOperation::Resolve => {
-                        if let Some(origin) = origin {
-                            let jobs: Vec<_> = self
-                                .world
-                                .jobs
-                                .iter()
-                                .filter(|(_, j)| j.origin == origin && !j.phase.is_draining())
-                                .map(|(id, _)| id)
-                                .collect();
-                            for job in jobs {
-                                self.retry_resolve(&mut actions, job, now);
-                            }
+                }
+                DispatchOperation::Resolve => {
+                    if let Some(origin) = origin {
+                        let jobs: Vec<_> = self
+                            .world
+                            .jobs
+                            .iter()
+                            .filter(|(_, j)| j.origin == origin && !j.phase.is_draining())
+                            .map(|(id, _)| id)
+                            .collect();
+                        for job in jobs {
+                            self.retry_resolve(&mut actions, job, now);
                         }
                     }
-                    DispatchOperation::SampleMirror => {
-                        if let Some(connection) = connection {
-                            if let Some(c) = self.world.connections.get(connection)
-                                && let (Some(job), Some(source)) = (c.owner, c.serving_source)
-                                && let Some(j) = self.world.jobs.get_mut(job)
-                            {
-                                j.probing_sources.retain(|sid| *sid != source);
-                                j.sampling_sources.retain(|sid| *sid != source);
-                                j.failed_sources.push(source);
-                            }
-                            actions.push(Action::CloseConnection { connection });
-                            self.drop_connection(connection);
+                }
+                DispatchOperation::SampleMirror => {
+                    if let Some(connection) = connection {
+                        if let Some(c) = self.world.connections.get(connection)
+                            && let (Some(job), Some(source)) = (c.owner, c.serving_source)
+                            && let Some(j) = self.world.jobs.get_mut(job)
+                        {
+                            j.probing_sources.retain(|sid| *sid != source);
+                            j.sampling_sources.retain(|sid| *sid != source);
+                            j.failed_sources.push(source);
                         }
+                        actions.push(Action::CloseConnection { connection });
+                        self.drop_connection(connection);
                     }
-                    DispatchOperation::PrepareDestination => {
-                        if let Some(job) = job {
-                            actions.extend(self.handle(
-                                Observation::DestinationPrepared {
-                                    job,
-                                    result: Err(DestinationFailure {
-                                        kind: DestinationFailureKind::DestinationError,
-                                    }),
-                                },
-                                now,
-                            ));
-                        }
-                    }
-                    DispatchOperation::CloseConnection
-                    | DispatchOperation::CloseLane
-                    | DispatchOperation::CommitDestination => {
-                        if let Some(job) = job {
-                            self.begin_fail(
-                                &mut actions,
+                }
+                DispatchOperation::PrepareDestination => {
+                    if let Some(job) = job {
+                        actions.extend(self.handle(
+                            Observation::DestinationPrepared {
                                 job,
-                                "state-changing command dispatch failed".into(),
-                            );
-                        }
+                                result: Err(DestinationFailure {
+                                    kind: DestinationFailureKind::DestinationError,
+                                }),
+                            },
+                            now,
+                        ));
                     }
                 }
-                if let Some(job) = job.or_else(|| assignment.map(|a| a.job))
-                    && let Some(origin) = self.world.jobs.get(job).map(|j| j.origin)
-                {
-                    self.pump(&mut actions, origin, now);
+                DispatchOperation::CloseConnection
+                | DispatchOperation::CloseLane
+                | DispatchOperation::CommitDestination => {
+                    if let Some(job) = job {
+                        self.begin_fail(
+                            &mut actions,
+                            job,
+                            "state-changing command dispatch failed".into(),
+                        );
+                    }
                 }
-            }
+            },
 
             Observation::ConnectionGone { connection } => {
                 self.reservations.remove(&connection);
@@ -1945,34 +1919,30 @@ impl Controller {
                 self.scale_connections(&mut actions, Some(origin), now);
                 self.ensure_probes(&mut actions, origin, now);
                 self.start_adaptive(&mut actions, origin, now);
-                if already_complete {
-                    if let Some(j) = self.world.jobs.get_mut(job) {
-                        j.phase = JobPhase::Committing;
-                        let len = j
-                            .plan
-                            .as_ref()
-                            .and_then(|p| p.total())
-                            .or(j.total_length)
-                            .unwrap_or(0);
-                        let integrity = match (j.integrity.expected, j.integrity.compute) {
-                            (Some(exp), _) => Some(crate::core::spec::DigestCheck {
-                                kind: exp.kind(),
-                                expected: Some(*exp.bytes()),
-                            }),
-                            (None, Some(kind)) => Some(crate::core::spec::DigestCheck {
-                                kind,
-                                expected: None,
-                            }),
-                            (None, None) => None,
-                        };
-                        actions.push(Action::CommitDestination {
-                            job,
-                            final_length: len,
-                            integrity,
-                        });
-                    }
-                } else {
-                    self.pump(&mut actions, origin, now);
+                if already_complete && let Some(j) = self.world.jobs.get_mut(job) {
+                    j.phase = JobPhase::Committing;
+                    let len = j
+                        .plan
+                        .as_ref()
+                        .and_then(|p| p.total())
+                        .or(j.total_length)
+                        .unwrap_or(0);
+                    let integrity = match (j.integrity.expected, j.integrity.compute) {
+                        (Some(exp), _) => Some(crate::core::spec::DigestCheck {
+                            kind: exp.kind(),
+                            expected: Some(*exp.bytes()),
+                        }),
+                        (None, Some(kind)) => Some(crate::core::spec::DigestCheck {
+                            kind,
+                            expected: None,
+                        }),
+                        (None, None) => None,
+                    };
+                    actions.push(Action::CommitDestination {
+                        job,
+                        final_length: len,
+                        integrity,
+                    });
                 }
                 return actions;
             }
@@ -2155,7 +2125,6 @@ impl Controller {
                     && needs_work
                 {
                     self.scale_connections(&mut actions, Some(origin), now);
-                    self.pump(&mut actions, origin, now);
                 }
                 self.world.assert_invariants();
             }
@@ -2205,7 +2174,6 @@ impl Controller {
                     .unwrap_or_default();
                 for origin in origins {
                     self.scale_connections(&mut actions, Some(origin), now);
-                    self.pump(&mut actions, origin, now);
                 }
             }
 
@@ -2241,12 +2209,6 @@ impl Controller {
                     actions.push(Action::CloseConnection { connection });
                     self.drop_connection(connection);
                     return actions;
-                }
-                // The sampling connection stays in the pool as a worker for
-                // this mirror. Pump it.
-                let origin = self.world.connections.get(connection).map(|c| c.origin);
-                if let Some(origin) = origin {
-                    self.pump(&mut actions, origin, now);
                 }
             }
 
@@ -2336,9 +2298,6 @@ impl Controller {
                         self.invalidate_origin_measurements(origin, now);
                     }
                     self.open_one_connection(&mut actions, origin, now, true);
-                    if transferring {
-                        self.pump(&mut actions, origin, now);
-                    }
                 }
             }
 
@@ -2368,17 +2327,15 @@ impl Controller {
                     {
                         plan.release_due(now);
                     }
-                    if let Some(origin) = self.world.jobs.get(job).map(|j| j.origin) {
-                        if self
+                    if let Some(origin) = self.world.jobs.get(job).map(|j| j.origin)
+                        && self
                             .world
                             .origins
                             .get(origin)
                             .is_none_or(|o| !o.is_cooled_down(now))
-                            && !self.world.has_ready_connection(origin)
-                        {
-                            self.open_one_connection(&mut actions, origin, now, true);
-                        }
-                        self.pump(&mut actions, origin, now);
+                        && !self.world.has_ready_connection(origin)
+                    {
+                        self.open_one_connection(&mut actions, origin, now, true);
                     }
                 }
                 TimerEvent::ResolveRetry { origin, host, port } => {
@@ -2395,7 +2352,6 @@ impl Controller {
                     {
                         self.open_one_connection(&mut actions, origin, now, true);
                     }
-                    self.pump(&mut actions, origin, now);
                 }
                 TimerEvent::CheckpointDue(_) => {}
                 TimerEvent::AdaptiveTick { job } => {
@@ -2857,15 +2813,12 @@ impl Controller {
             .filter(|(_, c)| c.owner == Some(job) && c.status == ConnectionStatus::Ready)
             .map(|(_, c)| c)
             .collect();
-        let multiplexed = ready
-            .iter()
-            .any(|c| c.protocol != crate::core::events::Protocol::Http1_1);
-        let effective_streams = if multiplexed {
-            desired.streams_per_connection
-        } else {
-            1
-        };
-        let wanted = (u32::from(desired.connections) * u32::from(effective_streams))
+        let multiplexed = !ready.is_empty()
+            && ready
+                .iter()
+                .all(|c| c.protocol != crate::core::events::Protocol::Http1_1);
+        let capacity = self.ready_job_capacity(job);
+        let wanted = u32::from(capacity.slots(u16::from(desired.connections)))
             .min(u32::from(j.policy.transport.max_active_assignments));
         let (active_bytes, active_wait, active_wall) =
             j.plan.iter().flat_map(|p| p.iter_assignments()).fold(
@@ -2906,11 +2859,16 @@ impl Controller {
             plan.in_flight() <= usize::from(j.grant.assignments)
                 && plan.iter_assignments().all(|(_, a)| {
                     a.connection.is_none_or(|connection| {
-                        self.in_flight_on(connection) <= usize::from(effective_streams)
+                        self.in_flight_on(connection) <= self.stream_capacity(connection)
                     })
                 })
         });
-        if ready.len() != usize::from(j.grant.connections) || !assignments_settled {
+        let mixed_protocols = ready.iter().any(|c| c.protocol == crate::Protocol::Http1_1)
+            && ready.iter().any(|c| c.protocol != crate::Protocol::Http1_1);
+        if ready.len() != usize::from(j.grant.connections)
+            || !assignments_settled
+            || mixed_protocols
+        {
             self.stats.planner_unsettled += 1;
             self.world.jobs[job].planner.suspend();
             actions.push(Action::ScheduleTimer {
@@ -3095,8 +3053,6 @@ impl Controller {
                 });
             }
         }
-        // First claims must use the cold topology grant, not the probe slot.
-        self.refresh_grants(now);
     }
 
     fn rebalance_job(&mut self, actions: &mut Vec<Action>, job: JobId, now: Instant) {
@@ -3257,35 +3213,6 @@ impl Controller {
         true
     }
 
-    fn pick_wfq_job(&self, connection: ConnectionId, now: Instant) -> Option<JobId> {
-        if self.occupied_slots() >= self.limits.max_active_assignments as usize {
-            return None;
-        }
-        let mut best: Option<(JobId, f64)> = None;
-        for (id, j) in self.world.jobs.iter() {
-            if !self.can_assign(id, connection, now) {
-                continue;
-            }
-            let w = eff_weight(j, now).max(1e-9);
-            let pending: u64 = j
-                .plan
-                .iter()
-                .flat_map(|p| p.iter_assignments())
-                .map(|(_, a)| a.remaining().min(j.policy.segmentation.max_piece))
-                .sum();
-            let score = j.virt_service + pending as f64 / w;
-            let is_better = match best {
-                None => true,
-                Some((_, s)) => score < s || (score == s && id < best.unwrap().0),
-            };
-            if is_better {
-                let _ = w;
-                best = Some((id, score));
-            }
-        }
-        best.map(|(id, _)| id)
-    }
-
     fn can_assign(&self, job: JobId, connection: ConnectionId, now: Instant) -> bool {
         let Some(c) = self.world.connections.get(connection) else {
             return false;
@@ -3305,29 +3232,58 @@ impl Controller {
         {
             return false;
         }
-        let plan = j.plan.as_ref().expect("runnable job has a plan");
-        let on_connection = plan
-            .iter_assignments()
-            .filter(|(_, a)| a.connection == Some(connection))
-            .count();
-        if on_connection >= usize::from(j.planner.desired().streams_per_connection) {
-            return false;
-        }
-        let used: std::collections::HashSet<_> = plan
-            .iter_assignments()
-            .filter_map(|(_, a)| a.connection)
+        true
+    }
+
+    fn granted_connections(&self) -> Vec<(ConnectionId, JobId)> {
+        let mut ready: Vec<_> = self
+            .world
+            .connections
+            .iter()
+            .filter_map(|(id, c)| {
+                let owner = c.owner?;
+                let j = self.world.jobs.get(owner)?;
+                (c.status == ConnectionStatus::Ready
+                    && j.phase == JobPhase::Transferring
+                    && j.grant.connections > 0
+                    && j.grant.assignments > 0
+                    && Self::protocol_allowed(&j.policy, c.protocol)
+                    && c.serving_source
+                        .is_none_or(|source| j.active_sources.contains(&source)))
+                .then_some((id, owner, self.stream_capacity(id)))
+            })
             .collect();
-        used.contains(&connection) || used.len() < usize::from(j.grant.connections)
+        ready.sort_unstable_by_key(|(id, owner, streams)| {
+            (*owner, std::cmp::Reverse(*streams), *id)
+        });
+        let mut previous = None;
+        let mut retained = 0;
+        ready.retain(|(_, owner, _)| {
+            if previous != Some(*owner) {
+                previous = Some(*owner);
+                retained = 0;
+            }
+            retained += 1;
+            retained <= self.world.jobs[*owner].grant.connections
+        });
+        ready
+            .into_iter()
+            .map(|(id, owner, _)| (id, owner))
+            .collect()
     }
 
     fn pump(&mut self, actions: &mut Vec<Action>, _origin: OriginId, now: Instant) {
+        // No I/O or grant changes occur inside this pump. Unselected busy
+        // connections keep their claims but cannot acquire replacement streams.
+        let granted = self.granted_connections();
         while self.occupied_slots() < self.limits.max_active_assignments as usize {
-            let candidate = self
-                .world
-                .connections
+            let candidate = granted
                 .iter()
-                .filter_map(|(conn, _)| {
-                    let job = self.pick_wfq_job(conn, now)?;
+                .copied()
+                .filter_map(|(conn, job)| {
+                    if !self.can_assign(job, conn, now) {
+                        return None;
+                    }
                     let j = &self.world.jobs[job];
                     let pending: u64 = j
                         .plan
@@ -3338,16 +3294,19 @@ impl Controller {
                     Some((
                         conn,
                         job,
-                        j.virt_service + pending as f64 / eff_weight(j, now).max(1e-9),
+                        j.virt_service + pending as f64 / j.priority.weight(),
                     ))
                 })
                 .min_by(|a, b| {
                     a.2.total_cmp(&b.2)
                         .then_with(|| a.1.cmp(&b.1))
                         .then_with(|| self.in_flight_on(a.0).cmp(&self.in_flight_on(b.0)))
+                        .then_with(|| self.stream_capacity(b.0).cmp(&self.stream_capacity(a.0)))
                 });
-            let Some((conn, _, _)) = candidate else { break };
-            if !self.claim_one(actions, conn, now) {
+            let Some((conn, job, _)) = candidate else {
+                break;
+            };
+            if !self.claim_one(actions, job, conn, now) {
                 break;
             }
         }
@@ -3361,9 +3320,7 @@ impl Controller {
             .unwrap_or(0)
     }
 
-    /// Best available speed estimate for sizing this connection's next
-    /// piece: its own measured receive rate, falling back to the origin's
-    /// recent window median, falling back to a conservative floor.
+    /// Measured connection receive rate, or the conservative startup estimate.
     fn connection_rate_estimate(&self, conn: ConnectionId) -> Rate {
         if let Some(ewma) = self
             .connection_state
@@ -3398,24 +3355,38 @@ impl Controller {
         }
     }
 
-    /// Claim at most one assignment on this connection for the best eligible
-    /// job (WFQ by virt_service). Returns true when a claim was dispatched.
+    fn ready_job_capacity(&self, job: JobId) -> crate::core::allocator::AssignmentCapacity {
+        let j = &self.world.jobs[job];
+        let mut serial = 0;
+        let mut multiplexed = 0;
+        for c in self.world.connections.values().filter(|c| {
+            c.owner == Some(job)
+                && c.status == ConnectionStatus::Ready
+                && Self::protocol_allowed(&j.policy, c.protocol)
+                && c.serving_source
+                    .is_none_or(|source| j.active_sources.contains(&source))
+        }) {
+            if c.protocol == crate::Protocol::Http1_1 {
+                serial += 1;
+            } else {
+                multiplexed += 1;
+            }
+        }
+        crate::core::allocator::AssignmentCapacity::Transfer {
+            serial,
+            multiplexed,
+            streams: j.planner.desired().streams_per_connection,
+        }
+    }
+
+    /// Dispatch the eligible pair selected by this synchronous pump.
     fn claim_one(
         &mut self,
         actions: &mut Vec<Action>,
+        job: JobId,
         connection: ConnectionId,
         now: Instant,
     ) -> bool {
-        let Some(c) = self.world.connections.get(connection) else {
-            return false;
-        };
-        if c.status != ConnectionStatus::Ready {
-            return false;
-        }
-        let Some(job) = self.pick_wfq_job(connection, now) else {
-            return false;
-        };
-
         let supports_ranges = self.world.jobs.get(job).is_some_and(|j| j.supports_ranges);
         let Some(claim) = self.claim_on_plan(job, connection, now) else {
             return false;
@@ -3493,11 +3464,24 @@ impl Controller {
     ) -> Option<ClaimedPiece> {
         let est = self.connection_rate_estimate(connection);
         let j = self.world.jobs.get(job)?;
-        let slots = usize::from(j.grant.assignments).max(1);
+        let lanes = j
+            .grant
+            .assignments
+            .min(self.ready_job_capacity(job).slots(j.grant.connections))
+            .max(1);
+        // Leave unclaimed work for granted physical connections still opening.
+        // Their slots are not yet eligible for assignment admission or rate sizing.
+        let slots = usize::from(
+            lanes.max(
+                j.grant
+                    .connections
+                    .min(j.policy.transport.max_active_assignments),
+            ),
+        );
         let solo = slots == 1;
         let competing =
             self.contended && matches!(self.limits.scheduling, crate::SchedulingPolicy::FairShare);
-        let quantum = match (competing, j.planner.assignment_quantum()) {
+        let quantum = match (competing, j.planner.assignment_quantum(lanes)) {
             (true, Some(learning)) => Some(learning.min(self.limits.fair_quantum_bytes.max(1))),
             (true, None) => Some(self.limits.fair_quantum_bytes.max(1)),
             (false, learning) => learning,
@@ -4008,6 +3992,13 @@ impl Controller {
     }
 
     fn begin_fail(&mut self, actions: &mut Vec<Action>, job: JobId, error: JobFailure) {
+        let pending: Vec<_> = self
+            .world
+            .connections
+            .iter()
+            .filter(|(id, c)| c.owner == Some(job) && self.control_busy(*id))
+            .map(|(id, _)| id)
+            .collect();
         let Some(j) = self.world.jobs.get_mut(job) else {
             return;
         };
@@ -4024,6 +4015,10 @@ impl Controller {
         }
         j.phase = JobPhase::Stopping(error);
         actions.push(Action::CancelTransfer { job });
+        for connection in pending {
+            actions.push(Action::CloseConnection { connection });
+            self.drop_connection(connection);
+        }
         self.try_complete_drain(actions, job);
     }
 
@@ -4139,22 +4134,39 @@ impl Controller {
         let Some(j) = self.world.jobs.remove(job) else {
             return;
         };
-        if let Some(d) = self.world.destinations.get_mut(j.destination)
-            && d.leased_by == Some(job)
-        {
-            d.leased_by = None;
-        }
-        let unused: Vec<_> = self
+        assert_eq!(
+            self.world.destination_leases.remove(&j.destination),
+            Some(job)
+        );
+        let pending: Vec<_> = self
             .world
             .connections
             .iter()
             .filter(|(_, c)| {
-                !self.world.jobs.iter().any(|(_, job)| {
-                    job.sources
-                        .iter()
-                        .any(|source| self.world.sources[*source].origin == c.origin)
-                })
+                c.owner == Some(job)
+                    && (c.serving_source.is_some() || c.status != ConnectionStatus::Ready)
             })
+            .map(|(id, _)| id)
+            .collect();
+        for connection in pending {
+            actions.push(Action::CloseConnection { connection });
+            self.drop_connection(connection);
+        }
+        for source in j.sources {
+            self.world.sources.remove(source);
+        }
+        let used_origins: std::collections::HashSet<_> = self
+            .world
+            .jobs
+            .values()
+            .flat_map(|job| &job.sources)
+            .map(|source| self.world.sources[*source].origin)
+            .collect();
+        let unused: Vec<_> = self
+            .world
+            .connections
+            .iter()
+            .filter(|(_, c)| !used_origins.contains(&c.origin))
             .map(|(id, _)| id)
             .collect();
         for connection in unused {
@@ -4176,9 +4188,6 @@ impl Controller {
             j.planner.invalidate();
         }
     }
-}
-fn eff_weight(j: &crate::core::world::JobNode, _now: Instant) -> f64 {
-    j.priority.weight()
 }
 
 fn jitter_for(now: Instant, epoch: Instant) -> f64 {

@@ -1,5 +1,45 @@
 use serde::Serialize;
 
+/// Kernel lifetime process high-water mark, including the in-process fixture.
+#[cfg(windows)]
+pub fn peak_working_set_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::{
+        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        Threading::GetCurrentProcess,
+    };
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of_val(&counters) as u32;
+    // Current-process pseudo handle and a correctly sized writable output.
+    if unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    } == 0
+    {
+        None
+    } else {
+        Some(counters.PeakWorkingSetSize as u64)
+    }
+}
+#[cfg(target_os = "linux")]
+pub fn peak_working_set_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1024)
+}
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn peak_working_set_bytes() -> Option<u64> {
+    None
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct CpuSample {
     pub total: u64,

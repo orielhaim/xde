@@ -3,7 +3,6 @@ use slotmap::new_key_type;
 new_key_type! {
     /// Generational job handle. A stale JobId can never alias a fresh job.
     pub struct JobId;
-    pub struct ArtifactId;
     pub struct SourceId;
     pub struct OriginId;
     pub struct EndpointId;
@@ -12,7 +11,6 @@ new_key_type! {
     pub struct SessionId;
     pub struct StreamId;
     pub struct AssignId;
-    pub struct DestinationId;
     pub struct NetworkContextId;
 }
 

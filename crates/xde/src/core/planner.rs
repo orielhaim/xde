@@ -22,7 +22,7 @@ pub struct Evidence {
     pub workload_context: u64,
 }
 /// Fractional gain per fractional resource increase, never total job speed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Productivity {
     pub connections: f64,
     pub assignments: f64,
@@ -191,13 +191,13 @@ impl JobPlanner {
     pub fn adaptive(&self) -> bool {
         matches!(self.policy, TopologyPolicy::Adaptive)
     }
-    pub fn assignment_quantum(&self) -> Option<u64> {
+    pub fn assignment_quantum(&self, effective_lanes: u16) -> Option<u64> {
         if !self.adaptive() {
             return None;
         }
         let rate = self.progress.rate;
         Some(if rate > 0.0 {
-            (rate / f64::from(self.desired.slots()) * (Self::WINDOW * 4).as_secs_f64())
+            (rate / f64::from(effective_lanes.max(1)) * (Self::WINDOW * 4).as_secs_f64())
                 .max((Self::MIN_BYTES * 4) as f64) as u64
         } else {
             self.bootstrap_piece
@@ -693,7 +693,25 @@ mod tests {
             m.step(512.0, 1 << 34, true, Constraint::Local, 0);
         }
         assert_eq!(m.planner.desired(), Topology::new(1, 1));
-        assert!(m.planner.assignment_quantum().unwrap() >= 128 << 20);
+        assert!(m.planner.assignment_quantum(1).unwrap() >= 128 << 20);
+    }
+
+    #[test]
+    fn range_horizon_uses_effective_lanes_without_changing_topology_intent() {
+        let mut m = Model::new(1 << 34, true);
+        m.planner.desired = Topology::new(2, 4);
+        m.planner.progress.rate = (128 << 20) as f64;
+        assert_eq!(m.planner.assignment_quantum(2), Some(64 << 20));
+        assert_eq!(m.planner.assignment_quantum(8), Some(16 << 20));
+        assert_eq!(m.planner.desired(), Topology::new(2, 4));
+        assert_eq!(
+            JobPlanner::new(
+                TopologyPolicy::Fixed(Topology::new(2, 4)),
+                Default::default()
+            )
+            .assignment_quantum(2),
+            None
+        );
     }
 
     fn curve(profile: usize, t: Topology) -> f64 {

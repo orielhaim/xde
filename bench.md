@@ -4,6 +4,10 @@ Use the current local source, locked dependencies and release binaries. The
 [scheduler report](docs/scheduling-results.md) identifies measured builds and
 retains complete raw cohorts. The [scheduler runner](benchmarks/2026-10-20-scheduler/README.md)
 reproduces alternating comparisons without an environmental CPU rejection gate.
+The [PR #1 investigation](docs/pr1-performance.md) records control-plane scaling,
+effective capacity/range corrections, matched regression pilots, H3 sender CPU
+attribution and controlled packet-delay measurements. Its [raw evidence](benchmarks/2026-10-23-pr1/raw.zip)
+includes source/build manifests and failed diagnostic attempts.
 
 ## Timing and eligibility
 
