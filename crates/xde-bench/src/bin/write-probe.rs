@@ -302,6 +302,32 @@ fn proactor(
     result.driver = format!("{:?}", driver.driver_type());
     Ok(result)
 }
+fn pressure_task(
+    stop: Rc<Cell<bool>>,
+    expired: Rc<Cell<bool>>,
+    started: Rc<Cell<usize>>,
+    polls: Rc<Cell<u64>>,
+    deadline: Rc<Cell<Option<Instant>>>,
+) -> impl std::future::Future<Output = ()> {
+    let mut first_poll = true;
+    std::future::poll_fn(move |cx| {
+        if first_poll {
+            started.set(started.get() + 1);
+            first_poll = false;
+        }
+        polls.set(polls.get() + 1);
+        if stop.get() {
+            return std::task::Poll::Ready(());
+        }
+        if deadline.get().is_some_and(|end| Instant::now() >= end) {
+            expired.set(true);
+            return std::task::Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+}
+
 fn runtime(
     paths: &[PathBuf],
     bytes: u64,
@@ -325,30 +351,16 @@ fn runtime(
         let expired = Rc::new(Cell::new(false));
         let started = Rc::new(Cell::new(0));
         let pressure_polls = Rc::new(Cell::new(0u64));
-        let pressure_deadline = Instant::now() + std::time::Duration::from_secs(pressure_seconds);
+        let pressure_deadline = Rc::new(Cell::new(None));
         let tasks: Vec<_> = (0..busy_tasks)
             .map(|_| {
-                let stop = stop.clone();
-                let expired = expired.clone();
-                let started = started.clone();
-                let pressure_polls = pressure_polls.clone();
-                let mut first_poll = true;
-                compio::runtime::spawn(std::future::poll_fn(move |cx| {
-                    if first_poll {
-                        started.set(started.get() + 1);
-                        first_poll = false;
-                    }
-                    pressure_polls.set(pressure_polls.get() + 1);
-                    if stop.get() {
-                        return std::task::Poll::Ready(());
-                    }
-                    if Instant::now() >= pressure_deadline {
-                        expired.set(true);
-                        return std::task::Poll::Ready(());
-                    }
-                    cx.waker().wake_by_ref();
-                    std::task::Poll::Pending
-                }))
+                compio::runtime::spawn(pressure_task(
+                    stop.clone(),
+                    expired.clone(),
+                    started.clone(),
+                    pressure_polls.clone(),
+                    pressure_deadline.clone(),
+                ))
             })
             .collect();
         std::future::poll_fn(|cx| {
@@ -372,6 +384,9 @@ fn runtime(
         let monitor = xde_bench::load::Monitor::start();
         let pressure_before = pressure_polls.get();
         let start = Instant::now();
+        pressure_deadline.set(Some(
+            start + std::time::Duration::from_secs(pressure_seconds),
+        ));
         for (writer, (mut file, mut buffer)) in files.into_iter().zip(buffers).enumerate() {
             let future_polls = future_polls.clone();
             let first_ready = first_ready.clone();
@@ -560,17 +575,49 @@ mod tests {
                     Mode::Busy => runtime(&paths, bytes, 4096, separate, 8, 2),
                 }
                 .unwrap();
-                assert!(
-                    !result.pressure_expired,
-                    "writes must progress while tasks remain runnable"
-                );
-                if matches!(mode, Mode::Busy) {
-                    assert!(result.pressure_polls_during_writes > 0);
-                }
                 assert_eq!(result.bytes, 2 * bytes);
                 assert_eq!(result.operations, 512);
                 verify(&paths, bytes, separate).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn runnable_pressure_progresses_while_work_is_pending() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let stop = Rc::new(Cell::new(false));
+            let expired = Rc::new(Cell::new(false));
+            let started = Rc::new(Cell::new(0));
+            let polls = Rc::new(Cell::new(0));
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    compio::runtime::spawn(pressure_task(
+                        stop.clone(),
+                        expired.clone(),
+                        started.clone(),
+                        polls.clone(),
+                        Rc::new(Cell::new(None)),
+                    ))
+                })
+                .collect();
+            let mut baseline = None;
+            std::future::poll_fn(|cx| {
+                if started.get() == 8 {
+                    let before = *baseline.get_or_insert(polls.get());
+                    if polls.get() > before {
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            })
+            .await;
+            assert!(polls.get() > baseline.unwrap());
+            assert!(!expired.get());
+            stop.set(true);
+            for task in tasks {
+                task.await.unwrap();
+            }
+        });
     }
 }

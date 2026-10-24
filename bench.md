@@ -102,3 +102,5 @@ throughput are different metrics. Loopback is useful for isolation; genuine netw
 latency, loss and shared-link behavior require independently validated experiments.
 
 [Adaptive intelligence results](docs/adaptive-intelligence-results.md) records the current policy validation and matched measurements.
+
+The next focused findings and preserved paired evidence are in [PR #1 pressure and scoped reclamation](docs/pr1-next-performance.md).

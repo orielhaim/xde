@@ -712,11 +712,23 @@ impl Controller {
 
     fn reconcile(&mut self, actions: &mut Vec<Action>, now: Instant) {
         self.refresh_grants(now);
+        let mut owned = slotmap::SecondaryMap::<JobId, usize>::new();
+        for c in self.world.connections.values() {
+            if let Some(owner) = c.owner {
+                *owned.entry(owner).unwrap().or_insert(0) += 1;
+            }
+        }
         let competition =
             self.contended && matches!(self.limits.scheduling, crate::SchedulingPolicy::FairShare);
         if competition {
-            for (_, j) in self.world.jobs.iter_mut() {
-                if !j.supports_ranges {
+            for (job, j) in self.world.jobs.iter_mut() {
+                let excess_connections =
+                    owned.get(job).copied().unwrap_or(0) > usize::from(j.grant.connections);
+                let excess_assignments = j
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.in_flight() > usize::from(j.grant.assignments));
+                if !j.supports_ranges || (!excess_connections && !excess_assignments) {
                     continue;
                 }
                 if let Some(plan) = j.plan.as_mut() {
@@ -738,12 +750,6 @@ impl Controller {
         }
         // Objects already executing keep their reservation until they drain.
         // New admissions use the reduced grant immediately.
-        let mut owned = slotmap::SecondaryMap::<JobId, usize>::new();
-        for c in self.world.connections.values() {
-            if let Some(owner) = c.owner {
-                *owned.entry(owner).unwrap().or_insert(0) += 1;
-            }
-        }
         let idle: Vec<_> = self
             .world
             .connections
@@ -3479,8 +3485,9 @@ impl Controller {
             ),
         );
         let solo = slots == 1;
-        let competing =
-            self.contended && matches!(self.limits.scheduling, crate::SchedulingPolicy::FairShare);
+        let competing = self.contended
+            && matches!(self.limits.scheduling, crate::SchedulingPolicy::FairShare)
+            && self.globally_constrained(job);
         let quantum = match (competing, j.planner.assignment_quantum(lanes)) {
             (true, Some(learning)) => Some(learning.min(self.limits.fair_quantum_bytes.max(1))),
             (true, None) => Some(self.limits.fair_quantum_bytes.max(1)),

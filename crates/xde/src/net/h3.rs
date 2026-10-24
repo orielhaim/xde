@@ -223,13 +223,9 @@ impl WireBody {
     }
 
     /// Drain any remaining body so the underlying stream can be reused.
-    pub async fn discard(&mut self) {
-        loop {
-            match self.next_data().await {
-                Ok(Some(d)) if !d.is_empty() => continue,
-                _ => break,
-            }
-        }
+    pub async fn discard(&mut self) -> Result<()> {
+        while self.next_data().await?.is_some() {}
+        Ok(())
     }
 }
 

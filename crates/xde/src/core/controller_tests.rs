@@ -1665,6 +1665,55 @@ fn global_headroom_prevents_futile_exploration_without_rewriting_user_limits() {
 }
 
 #[test]
+fn contention_at_another_origin_does_not_truncate_a_fully_granted_job() {
+    let mut c = Controller::new();
+    c.set_engine_limits(&crate::EngineLimits {
+        max_connections_per_origin: 1,
+        fair_quantum_bytes: 1024,
+        ..Default::default()
+    });
+    let now = Instant::now();
+    let mut request = spec("https://independent.test/a");
+    request.policy.topology = crate::TopologyPolicy::Fixed(crate::Topology::new(1, 1));
+    let job = admit(&mut c, request, "a", now);
+    drive_to_transfer(&mut c, job, now, crate::Protocol::Http2, 64 << 20);
+    let (assignment, range) = active_assignment(&c, job);
+    admit(&mut c, spec("https://crowded.test/a"), "b", now);
+    admit(&mut c, spec("https://crowded.test/b"), "c", now);
+    assert!(c.contended);
+    assert_eq!(c.world.jobs[job].grant.connections, 1);
+    assert_eq!(c.world.jobs[job].grant.assignments, 1);
+    let a = c.world.jobs[job]
+        .plan
+        .as_ref()
+        .unwrap()
+        .assignment(assignment.assignment)
+        .unwrap();
+    assert_eq!(
+        a.control.end.load(std::sync::atomic::Ordering::Relaxed),
+        range.end
+    );
+    assert!(!a.truncated);
+    let connection = a.connection.unwrap();
+    c.handle(
+        Observation::AssignmentVerified {
+            job,
+            assignment,
+            range,
+            sample: sample(range.len(), 10, 0),
+            connection,
+            connection_reusable: true,
+        },
+        now,
+    );
+    let (_, next_range) = active_assignment(&c, job);
+    assert!(
+        next_range.len() > c.limits.fair_quantum_bytes,
+        "unrelated contention must not cap replacement claims either"
+    );
+}
+
+#[test]
 fn independent_jobs_with_spare_capacity_do_not_force_byte_quanta() {
     let mut c = Controller::new();
     let now = Instant::now();

@@ -12,11 +12,11 @@ COHORTS = ["pr1-baseline", "pr1-control", "pr1-effective", "pr1-final",
 SUFFIXES = {".json", ".log", ".txt", ".patch", ".sha256", ".affinity", ".stderr", ".data"}
 
 
-def bundle(root, output):
+def bundle(root, output, cohorts=COHORTS):
     if output.exists():
         raise FileExistsError(f"Refusing to replace evidence: {output}")
     files = {}
-    for cohort in COHORTS:
+    for cohort in cohorts:
         directory = root / "target" / cohort
         for path in sorted(directory.rglob("*")):
             relative = path.relative_to(directory)
@@ -43,5 +43,6 @@ def bundle(root, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
+    parser.add_argument("--cohort", action="append", help="Select evidence directories under target")
     args = parser.parse_args()
-    bundle(Path.cwd(), args.output.resolve())
+    bundle(Path.cwd(), args.output.resolve(), args.cohort or COHORTS)

@@ -15,6 +15,7 @@ $cases = @(
     @{Name='h3-fixed'; Args=@('--protocol','h3','--mode','single','--size-mib','4096','--jobs','1')},
     @{Name='h1-8'; Args=@('--protocol','h1','--mode','single','--size-mib','8','--jobs','8','--global-connections','16','--assignments','16','--shared-origin')},
     @{Name='h1-128'; Args=@('--protocol','h1','--mode','single','--size-mib','8','--jobs','128','--global-connections','16','--assignments','16','--shared-origin')},
+    @{Name='h2-contended'; Args=@('--protocol','h2','--mode','fixed','--size-mib','1024','--jobs','2','--connections','2','--streams','1','--global-connections','3','--assignments','3')},
     @{Name='h2-adaptive'; Args=@('--protocol','h2','--mode','adaptive','--size-mib','4096','--jobs','1','--connections','4','--streams','4')},
     @{Name='h3-adaptive'; Args=@('--protocol','h3','--mode','adaptive','--size-mib','4096','--jobs','1','--connections','4','--streams','4')}
 )
@@ -22,7 +23,7 @@ if ($CaseName.Count) {
     $cases = @($cases | Where-Object {$_.Name -in $CaseName})
     if ($cases.Count -ne $CaseName.Count) {throw 'Unknown or repeated case name'}
 } else {
-    $cases = @($cases | Where-Object {$_.Name -notin @('h2-adaptive','h3-adaptive')})
+    $cases = @($cases | Where-Object {$_.Name -notin @('h2-adaptive','h3-adaptive','h2-contended')})
 }
 for ($trial=$StartTrial; $trial -lt $StartTrial + $Trials; $trial++) {
     $ordered = @($cases)
