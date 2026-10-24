@@ -15,21 +15,22 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        rust: ["1.98.0"]
+        rust: ["1.99.0"]
         include:
+          - os: ubuntu-latest
+            rust: "1.98.0"
           - os: ubuntu-latest
             rust: stable
             experimental: true
     continue-on-error: ${{ matrix.experimental || false }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust ${{ matrix.rust }}
         run: |
-          rustup toolchain install ${{ matrix.rust }} --profile minimal
-          rustup default ${{ matrix.rust }}
-          rustup component add rustfmt clippy
+          rustup toolchain install ${{ matrix.rust }} --profile minimal --component rustfmt --component clippy
+          rustup component list --toolchain ${{ matrix.rust }} --installed
 
       - uses: Swatinem/rust-cache@v2
 
@@ -39,23 +40,23 @@ jobs:
           tool: nextest
 
       - name: fmt
-        if: matrix.rust == '1.98.0' && matrix.os == 'ubuntu-latest'
+        if: matrix.rust == '1.99.0' && matrix.os == 'ubuntu-latest'
         run: cargo +${{ matrix.rust }} fmt --all -- --check
 
       - name: clippy
-        if: matrix.rust == '1.98.0'
-        run: cargo +${{ matrix.rust }} clippy --workspace --all-targets -- -D warnings
+        if: matrix.rust == '1.99.0'
+        run: cargo +${{ matrix.rust }} clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: nextest
-        run: cargo +${{ matrix.rust }} nextest run --workspace
+        run: cargo +${{ matrix.rust }} nextest run --workspace --all-features --locked
 
       - name: doctests
-        run: cargo +${{ matrix.rust }} test --workspace --doc
+        run: cargo +${{ matrix.rust }} test --workspace --all-features --locked --doc
 
       - name: whitespace
-        if: matrix.rust == '1.98.0' && matrix.os == 'ubuntu-latest'
+        if: matrix.rust == '1.99.0' && matrix.os == 'ubuntu-latest'
         run: git diff --check
 
       - name: unused deps
-        if: matrix.rust == '1.98.0' && matrix.os == 'ubuntu-latest'
+        if: matrix.rust == '1.99.0' && matrix.os == 'ubuntu-latest'
         uses: bnjbvr/cargo-machete@main

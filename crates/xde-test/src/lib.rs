@@ -12,7 +12,7 @@ pub mod spec;
 pub use h1::{H1Server, spawn_h1};
 pub use h2::{H2Server, spawn_h2c};
 pub use h3::{DualH3, spawn_h1h3};
-pub use spec::{FixtureSpec, FixtureStats, Redirect, SharedStats, Truncate};
+pub use spec::{FixtureSpec, FixtureStats, RangeBehavior, Redirect, SharedStats, Truncate};
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -99,8 +99,7 @@ impl Default for DownloadEnv {
 
 pub fn conservative_policy() -> TransferPolicy {
     TransferPolicy {
-        initial_physical_connections: 1,
-        initial_streams_per_connection: 1,
+        topology: xde::TopologyPolicy::Fixed(xde::Topology::new(1, 1)),
         ..TransferPolicy::default()
     }
 }

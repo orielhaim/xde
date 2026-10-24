@@ -52,25 +52,9 @@ pub enum Event {
     },
     WorkerFinished {
         job: JobId,
+        connection: ConnectionId,
         range: ByteRange,
-        rate: Rate,
-        receive_active: Duration,
-        destination_blocked: Duration,
-        next_pending: Duration,
-        max_frame_gap: Duration,
-        send_ready: Duration,
-        headers: Duration,
-        data_frames: u64,
-        dest_accepts: u64,
-        copy_count: u64,
-        copied_bytes: u64,
-        avg_frame: u32,
-        frame_p50: u32,
-        frame_p90: u32,
-        io_reads_submitted: u64,
-        io_reads_completed: u64,
-        zero_read: Duration,
-        max_zero_read: Duration,
+        sample: Box<crate::core::metrics::TransferSample>,
     },
     RangeSplit {
         job: JobId,
@@ -156,7 +140,6 @@ pub enum Event {
 pub enum Protocol {
     Http1_1,
     Http2,
-    /// Reserved; not reachable in v0.1.
     Http3,
 }
 

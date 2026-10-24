@@ -119,51 +119,15 @@ This allows XDE to be used with storage backends other than a normal file.
 * custom destinations
 * bounded memory usage
 
-## Adaptive concurrency
+## Performance validation
 
-XDE does not assume that more connections are always faster.
+Per-job planners request topology; the engine grants shared resources through
+FairShare or Queue scheduling. See [scheduling and configuration](docs/scheduling.md)
+and [measured results and limitations](docs/scheduling-results.md).
 
-It starts with low concurrency, measures transfer throughput, and increases concurrency when doing so produces a useful gain. Scaling stops when additional workers stop improving the transfer enough to justify them.
-
-The following benchmark uses a server that limits each TCP connection to `4 MiB/s`.
-
-With a single connection, throughput is therefore limited to approximately `4 MiB/s`.
-
-No connection count was configured for XDE:
-
-|       | Throughput | Connections opened |
-| ----- | ---------: | -----------------: |
-| Run 1 | 10.8 MiB/s |                  7 |
-| Run 2 | 10.8 MiB/s |                  7 |
-| Run 3 | 10.8 MiB/s |                  7 |
-
-The engine detected that additional connections increased aggregate throughput and scaled the transfer automatically.
-
-Seven connections is not a target or a preset. It is the result of the runtime scaling policy for this benchmark.
-
-## Performance
-
-On a Windows loopback HTTP/1.1 benchmark:
-
-|      |          16 MiB |          256 MiB |
-| ---- | --------------: | ---------------: |
-| XDE  | **569.5 MiB/s** | **1516.7 MiB/s** |
-| curl |     447.5 MiB/s |     1123.3 MiB/s |
-
-A separate fixed-concurrency benchmark limits the server to `100 MiB/s` per connection:
-
-| Connections |         XDE |
-| ----------: | ----------: |
-|           1 |  99.4 MiB/s |
-|           2 | 197.1 MiB/s |
-|           3 | 293.1 MiB/s |
-|           4 | 388.9 MiB/s |
-
-This benchmark disables the adaptive decision-making and measures how well the transfer engine scales once concurrency is available.
-
-HTTP/2 performance on Windows is currently slightly below curl.
-
-Full methodology and results are available in [`bench.md`](bench.md).
+Benchmarks retain complete paired distributions. CPU activity is diagnostic
+metadata, not a timing rejection threshold. See [benchmark requirements](bench.md).
+Earlier reports retain their historical labels.
 
 ## Status
 
@@ -176,3 +140,5 @@ Bug reports, benchmarks and patches are welcome.
 ## License
 
 [Apache-2.0](LICENSE)
+
+[Adaptive intelligence results](docs/adaptive-intelligence-results.md) records the current policy validation and matched measurements.

@@ -1,17 +1,7 @@
-//! Speed-aware dynamic segmentation.
+//! Range ownership with acknowledged request yields.
 //!
-//! The base is IDM-style dynamic segmentation, which is really work stealing:
-//! when a worker frees up, find the segment with the most bytes left and split it.
-//! Our change is the cut point. IDM splits 50/50. If we are already measuring
-//! throughput there is no reason to guess: with `R` bytes left, an incumbent at
-//! `v1` and a newcomer estimated at `v2`, the point that finishes both at the
-//! same instant is
-//!
-//! ```text
-//! x = R * v1 / (v1 + v2)
-//! ```
-//!
-//! A newcomer three times faster gets three quarters, not half.
+//! A running assignment retains its complete claim until its terminal observation.
+//! Tail work becomes claimable only after pending destination operations drain.
 
 use std::time::{Duration, Instant};
 
@@ -26,10 +16,44 @@ use crate::core::{
     units::Rate,
 };
 
+/// One writer publishes coarse consumed progress; the controller samples it.
+/// The end boundary is independently updated by range retirement.
+#[derive(Debug)]
+pub struct AssignmentControl {
+    pub end: std::sync::atomic::AtomicU64,
+    pub consumed: std::sync::atomic::AtomicU64,
+    pub local_wait_nanos: std::sync::atomic::AtomicU64,
+}
+impl AssignmentControl {
+    fn new(end: u64) -> Self {
+        Self {
+            end: end.into(),
+            consumed: 0.into(),
+            local_wait_nanos: 0.into(),
+        }
+    }
+    pub fn publish(&self, bytes: u64, wait: Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.local_wait_nanos
+            .store(wait.as_nanos().min(u128::from(u64::MAX)) as u64, Relaxed);
+        self.consumed.store(bytes, Relaxed);
+    }
+    pub fn bytes(&self) -> u64 {
+        self.consumed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn local_wait(&self) -> Duration {
+        Duration::from_nanos(
+            self.local_wait_nanos
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Assignment {
-    /// The span this worker owns. The tail can be stolen while it runs.
+    /// Owned until the terminal observation, including pending destination writes.
     pub range: ByteRange,
+    pub control: std::sync::Arc<AssignmentControl>,
     pub wire_received: u64,
     pub destination_submitted: u64,
     pub destination_committed: u64,
@@ -86,8 +110,8 @@ impl Assignment {
 pub enum Claim {
     /// A brand new gap in the file.
     Fresh(AssignId),
-    /// Stolen from the tail of an existing assignment.
-    Stolen { new: AssignId, from: AssignId },
+    /// Ask an incumbent to drain; its tail remains claimed until acknowledgement.
+    Yield { assignment: AssignId, new_end: u64 },
     /// Nothing to do: everything is claimed and nothing is worth splitting.
     Saturated,
     /// The transfer is finished.
@@ -176,26 +200,16 @@ impl SegmentPlan {
     }
 
     /// Can another assignment start right now?
-    pub fn admits_worker(&self) -> bool {
+    pub fn admits_worker(&self, now: Instant) -> bool {
         match self.total {
+            Some(total) if self.completed.is_complete(total) => false,
+            Some(_) if self.single_stream => self.assignments.is_empty(),
             Some(total) => {
-                if self.single_stream {
-                    self.assignments.is_empty() && !self.completed.is_complete(total)
-                } else {
-                    self.has_unclaimed() && !self.completed.is_complete(total)
-                }
+                self.next_claimable_gap(total, now).is_some()
+                    || self.plan_yield(Rate::COLD_START, now).is_some()
             }
-            // Unknown length: single-stream only.
             None => self.assignments.is_empty(),
         }
-    }
-    pub fn has_unclaimed(&self) -> bool {
-        self.total.is_some_and(|total| {
-            self.claimed
-                .first_gap(0, total)
-                .is_some_and(|gap| !self.gap_is_deferred(gap, Instant::now()))
-                || self.deferred.iter().any(|d| d.until <= Instant::now())
-        })
     }
 
     fn gap_is_deferred(&self, gap: ByteRange, now: Instant) -> bool {
@@ -323,12 +337,23 @@ impl SegmentPlan {
         self.claim_with(est, now, false, 2)
     }
 
-    /// `solo` is a policy that cannot add another connection or stream: do
-    /// not reserve half the artifact for a teammate that will never appear.
-    /// `peer_slots` is how many physical connections this job may open;
+    /// `solo` means only one logical slot is currently granted. A later
+    /// grant can obtain tail work through an acknowledged yield.
+    /// `peer_slots` is the number of logical transfer slots available to this job;
     /// first claims carve unclaimed bytes into that many pieces instead of
     /// parking half the file behind a 2s steal grace.
-    pub fn claim_with(&mut self, est: Rate, now: Instant, solo: bool, peer_slots: u8) -> Claim {
+    pub fn claim_with(&mut self, est: Rate, now: Instant, solo: bool, peer_slots: usize) -> Claim {
+        self.claim_bounded(est, now, solo, peer_slots, None)
+    }
+
+    pub fn claim_bounded(
+        &mut self,
+        est: Rate,
+        now: Instant,
+        solo: bool,
+        peer_slots: usize,
+        quantum: Option<u64>,
+    ) -> Claim {
         let Some(total) = self.total else {
             // Unknown length: exactly one stream, from wherever we left off.
             if !self.assignments.is_empty() {
@@ -357,19 +382,21 @@ impl SegmentPlan {
             return Claim::Fresh(id);
         }
         let remaining_total = total - self.completed.covered_len();
-        let piece = self.piece_len_for(est, remaining_total);
+        let piece = self
+            .piece_len_for(est, remaining_total)
+            .min(quantum.unwrap_or(u64::MAX));
 
         // 1. Prefer a virgin gap that is not in retry backoff.
         if let Some(gap) = self.next_claimable_gap(total, now) {
             let mut take_len = piece.max(1);
             if !solo {
-                let inflight = u8::try_from(self.assignments.len()).unwrap_or(u8::MAX);
+                let inflight = self.assignments.len();
                 let slots_left = peer_slots.max(1).saturating_sub(inflight).max(1);
                 if slots_left > 1 {
                     let unclaimed = total.saturating_sub(self.claimed.covered_len());
                     if unclaimed > self.cfg.min_piece.saturating_mul(2) {
                         take_len = take_len
-                            .min(unclaimed / u64::from(slots_left))
+                            .min(unclaimed / slots_left as u64)
                             .max(self.cfg.min_piece);
                     }
                 }
@@ -403,32 +430,20 @@ impl SegmentPlan {
         if solo {
             return Claim::Saturated;
         }
-        match self.plan_steal(est, now) {
+        match self.plan_yield(est, now) {
             Some((victim, cut)) => {
-                let victim_range = self.assignments[victim].range;
-                self.assignments[victim].range = ByteRange::new(victim_range.start, cut);
                 self.assignments[victim].truncated = true;
-                let stolen = ByteRange::new(cut, victim_range.end);
-                // The prefix belongs to the still-active victim, so it is not
-                // safe to read back yet. Fresh stolen boundaries rely on exact
-                // Content-Range validation and final integrity instead.
-                let overlap = 0;
-                let new = self.push_assignment(stolen, now, overlap);
-                tracing::debug!(
-                    target: "xde::segment",
-                    ?victim_range, cut, ?stolen, "range stolen"
-                );
-                Claim::Stolen { new, from: victim }
+                Claim::Yield {
+                    assignment: victim,
+                    new_end: cut,
+                }
             }
             None => Claim::Saturated,
         }
     }
 
-    /// Pick the victim and compute the speed-aware cut point. The victim is
-    /// the assignment that will finish LAST (max remaining/rate), not merely
-    /// the fattest one: a huge piece on a fast worker is fine, a moderate
-    /// piece on a straggler is what delays completion.
-    fn plan_steal(&self, est: Rate, now: Instant) -> Option<(AssignId, u64)> {
+    /// Request an incumbent yield; its original claim remains reserved.
+    fn plan_yield(&self, est: Rate, now: Instant) -> Option<(AssignId, u64)> {
         let (victim, a) = self
             .assignments
             .iter()
@@ -445,10 +460,11 @@ impl SegmentPlan {
                 ((a.remaining() as f64 / rate.max(1.0)) * 1e6) as u64
             })?;
 
-        let protected = a
-            .range
-            .start
-            .saturating_add(a.wire_received.max(a.destination_submitted));
+        let protected = a.range.start.saturating_add(
+            a.wire_received
+                .max(a.destination_submitted)
+                .max(a.control.bytes()),
+        );
         let rem = a.range.end.saturating_sub(protected);
         let tail = self
             .bytes_remaining()
@@ -464,18 +480,8 @@ impl SegmentPlan {
             return None;
         }
 
-        let v1 = if a.rate.is_warm() {
-            a.rate.mean()
-        } else {
-            est.nonzero()
-        };
-        let v1 = v1.max(Rate::FLOOR.bps());
-        let v2 = est.nonzero();
-
-        // x = R * v1 / (v1 + v2) stays with the incumbent.
-        let keep = ((rem as f64) * (v1 / (v1 + v2))) as u64;
-        let keep = keep.clamp(min_piece, rem - min_piece);
-        let cut = align_up(protected + keep, self.cfg.alignment).min(a.range.end - min_piece);
+        let cut = align_up(protected.saturating_add(min_piece), self.cfg.alignment)
+            .min(a.range.end - min_piece);
 
         (cut > a.cursor() && cut < a.range.end).then_some((victim, cut))
     }
@@ -486,6 +492,7 @@ impl SegmentPlan {
         }
         self.assignments.insert(Assignment {
             range,
+            control: std::sync::Arc::new(AssignmentControl::new(range.end)),
             wire_received: 0,
             destination_submitted: 0,
             destination_committed: 0,
@@ -686,14 +693,7 @@ impl SegmentPlan {
             .collect()
     }
 
-    /// Proactive straggler rebalance: shrink each detected straggler to
-    /// roughly one window of its own work and release the rest as unclaimed,
-    /// so faster workers pick it up at the next pump. Returns the cuts as
-    /// `(assignment, new_end)` pairs - the caller MUST forward them to the
-    /// owning connection so the running request stops at the new boundary;
-    /// otherwise the straggler and its replacement would download the same
-    /// bytes twice. This is how a 40 MiB/s worker avoids owning a huge tail
-    /// while 200 MiB/s workers are fast.
+    /// Request a straggler yield without releasing its range ownership.
     pub fn rebalance_stragglers(&mut self, now: Instant) -> SmallVec<[(AssignId, u64); 4]> {
         let mut cuts = SmallVec::new();
         if self.assignments.len() < 2 {
@@ -726,34 +726,13 @@ impl SegmentPlan {
             if new_end >= end || new_end <= cursor {
                 continue;
             }
-            {
-                let victim = self.assignments.get_mut(id).expect("checked above");
-                victim.range = ByteRange::new(victim.range.start, new_end);
-                victim.truncated = true;
+            if a.truncated {
+                continue;
             }
-            // Release only genuinely unclaimed tail bytes: whatever anyone
-            // already verified stays claimed.
-            let tail_start = new_end;
-            let mut pos = tail_start;
-            for c in self.completed.iter() {
-                if c.end <= pos {
-                    continue;
-                }
-                if c.start >= end {
-                    break;
-                }
-                if c.start > pos {
-                    let hole = ByteRange::new(pos, c.start.min(end));
-                    self.claimed.remove(hole);
-                }
-                pos = pos.max(c.end);
-                if pos >= end {
-                    break;
-                }
-            }
-            if pos < end {
-                self.claimed.remove(ByteRange::new(pos, end));
-            }
+            self.assignments
+                .get_mut(id)
+                .expect("checked above")
+                .truncated = true;
             cuts.push((id, new_end));
         }
         cuts
@@ -880,7 +859,7 @@ mod tests {
         plan.abandon(assignment);
         assert_eq!(plan.bytes_done(), 0);
         assert!(!plan.is_complete());
-        assert!(plan.has_unclaimed());
+        assert!(plan.admits_worker(now));
     }
 
     #[test]
@@ -904,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn stealing_never_crosses_the_submitted_frontier() {
+    fn yielding_keeps_ownership_until_pending_writes_are_acknowledged() {
         let now = Instant::now();
         let cfg = SegmentationPolicy {
             min_piece: 1,
@@ -914,15 +893,36 @@ mod tests {
             ..SegmentationPolicy::default()
         };
         let mut plan = SegmentPlan::new(Some(100), RangeSet::new(), cfg, Duration::from_secs(1), 0);
-        let Claim::Fresh(assignment) = plan.claim(Rate::from_bps(100.0), now) else {
+        let Claim::Fresh(assignment) = plan.claim_with(Rate::from_bps(100.0), now, true, 1) else {
             panic!("assignment")
         };
         plan.on_wire_received(assignment, 70);
         plan.on_submitted(assignment, 60);
         let claim = plan.claim(Rate::from_bps(100.0), now);
-        if let Claim::Stolen { new, .. } = claim {
-            assert!(plan.assignment(new).unwrap().range.start >= 70);
-        }
+        let Claim::Yield {
+            assignment: victim,
+            new_end,
+        } = claim
+        else {
+            panic!("yield")
+        };
+        assert_eq!(victim, assignment);
+        assert!(new_end >= 70);
+        assert_eq!(
+            plan.assignment(victim).unwrap().range,
+            ByteRange::new(0, 100)
+        );
+        assert!(matches!(
+            plan.claim(Rate::from_bps(100.0), now),
+            Claim::Saturated
+        ));
+        plan.on_destination_committed(victim, ByteRange::new(0, 80), now);
+        plan.on_response_verified(victim, ByteRange::new(0, 80), now);
+        plan.finish_verified(victim).unwrap();
+        let Claim::Fresh(next) = plan.claim(Rate::from_bps(100.0), now) else {
+            panic!("released tail")
+        };
+        assert_eq!(plan.assignment(next).unwrap().range.start, 80);
     }
 
     proptest::proptest! {
@@ -944,8 +944,8 @@ mod tests {
             let mut ids = Vec::new();
             for _ in 0..8 {
                 match plan.claim(Rate::from_bps(piece as f64), now) {
-                    Claim::Fresh(id) | Claim::Stolen { new: id, .. } => ids.push(id),
-                    Claim::Saturated | Claim::Complete => break,
+                    Claim::Fresh(id) => ids.push(id),
+                    Claim::Yield { .. } | Claim::Saturated | Claim::Complete => break,
                 }
             }
             let mut seen = RangeSet::new();

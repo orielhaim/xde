@@ -112,11 +112,7 @@ pub async fn probe_source(
             .map_err(|error| Error::protocol(format!("invalid redirect Location: {error}")))?;
         {
             let body = &mut resp.body;
-            before_deadline(deadline, async {
-                body.discard().await;
-                Ok(())
-            })
-            .await?;
+            before_deadline(deadline, body.discard()).await?;
         }
         return Ok(ProbeOutcome::Redirect {
             status: status.as_u16(),
@@ -132,11 +128,7 @@ pub async fn probe_source(
     if status != http::StatusCode::OK {
         {
             let body = &mut resp.body;
-            before_deadline(deadline, async {
-                body.discard().await;
-                Ok(())
-            })
-            .await?;
+            before_deadline(deadline, body.discard()).await?;
         }
     }
 
@@ -255,5 +247,71 @@ where
     match futures_util::future::select(future, timeout).await {
         futures_util::future::Either::Left((result, _)) => result,
         futures_util::future::Either::Right(((), _)) => Err(Error::DeadlineExceeded),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[rstest::rstest]
+    #[case::range("206 Partial Content", "Content-Range: bytes 0-0/1024")]
+    #[case::redirect("302 Found", "Location: /next")]
+    fn truncated_probe_body_is_not_a_reusable_response(
+        #[case] status: &'static str,
+        #[case] metadata: &'static str,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\n{metadata}\r\nContent-Length: 1\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let result = compio::runtime::Runtime::new().unwrap().block_on(async {
+            use crate::net::connector::{ConnectTarget, Connector, ConnectorConfig};
+            let url = Url::parse(&format!("http://{addr}/file")).unwrap();
+            let connector = Connector::new(ConnectorConfig::default()).unwrap();
+            let (mut connection, _) = connector
+                .connect(&ConnectTarget {
+                    http_version: crate::HttpVersionPolicy::Http1Only,
+                    key: crate::core::ids::TransportOriginKey::from_url(&url).unwrap(),
+                    addr,
+                    sni: "127.0.0.1".into(),
+                    tls: false,
+                })
+                .await
+                .unwrap();
+            let mut session = connection.open_session().unwrap();
+            let result = probe_source(
+                &mut session,
+                &url,
+                &http::HeaderMap::new(),
+                false,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .await;
+            drop(session);
+            connection.close().await;
+            result
+        });
+        server.join().unwrap();
+        assert!(
+            result.is_err(),
+            "an incomplete probe must fail rather than mark the connection reusable"
+        );
     }
 }

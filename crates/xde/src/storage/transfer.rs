@@ -11,6 +11,7 @@ use std::sync::{
 struct BudgetInner {
     limit: u64,
     used: AtomicU64,
+    staging: AtomicU64,
     available: Event,
     /// Bytes kept out of reach for speculative acquirers so the worker that
     /// advances the artifact frontier can always obtain memory.
@@ -43,6 +44,7 @@ impl MemoryBudget {
         Self(Arc::new(BudgetInner {
             limit: limit.max(1),
             used: AtomicU64::new(0),
+            staging: AtomicU64::new(0),
             available: Event::new(),
             reserve,
         }))
@@ -55,6 +57,38 @@ impl MemoryBudget {
     }
     pub fn available(&self) -> u64 {
         self.limit().saturating_sub(self.used())
+    }
+
+    pub fn max_payload_bytes(&self) -> usize {
+        usize::try_from((self.limit() / 2).max(1)).unwrap_or(usize::MAX)
+    }
+
+    /// Staging owns separate physical storage. It may reserve at most half
+    /// the budget, leaving payload acquisitions able to make progress.
+    pub(crate) fn try_staging(&self, bytes: u64) -> Option<MemoryPermit> {
+        let limit = (self.limit() / 2).min(self.limit() - self.0.reserve);
+        self.0
+            .staging
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= limit)
+            })
+            .ok()?;
+        if self
+            .0
+            .used
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= self.limit())
+            })
+            .is_err()
+        {
+            self.0.staging.fetch_sub(bytes, Ordering::AcqRel);
+            return None;
+        }
+        Some(MemoryPermit {
+            budget: self.clone(),
+            bytes,
+            kind: ReservationKind::Staging,
+        })
     }
     /// Acquire memory with an explicit forward-progress class. `Frontier`
     /// acquisitions may consume the reserve; speculative ones may not.
@@ -112,6 +146,7 @@ impl MemoryBudget {
                         return Ok(MemoryPermit {
                             budget: self.clone(),
                             bytes,
+                            kind: ReservationKind::Payload,
                         });
                     }
                     let listener = self.0.available.listen();
@@ -126,12 +161,25 @@ impl MemoryBudget {
 }
 
 #[derive(Debug)]
-struct MemoryPermit {
+pub(crate) struct MemoryPermit {
     budget: MemoryBudget,
     bytes: u64,
+    kind: ReservationKind,
+}
+
+#[derive(Debug)]
+enum ReservationKind {
+    Payload,
+    Staging,
 }
 impl Drop for MemoryPermit {
     fn drop(&mut self) {
+        if matches!(self.kind, ReservationKind::Staging) {
+            self.budget
+                .0
+                .staging
+                .fetch_sub(self.bytes, Ordering::AcqRel);
+        }
         self.budget.0.used.fetch_sub(self.bytes, Ordering::AcqRel);
         self.budget.0.available.notify(usize::MAX);
     }

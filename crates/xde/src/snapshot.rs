@@ -9,6 +9,13 @@ use crate::core::events::Protocol;
 /// Current state of one job, projected for consumers/UIs.
 #[derive(Debug, Clone)]
 pub struct JobSnapshot {
+    pub desired: crate::Topology,
+    pub granted: crate::ResourceGrant,
+    pub queued: bool,
+    pub globally_constrained: bool,
+    pub opening_connections: usize,
+    /// Consumed payload, including active unverified ranges. Not publication evidence.
+    pub consumed_bytes: u64,
     pub phase: JobPhase,
     /// Total artifact length, when known.
     pub total_length: Option<u64>,
@@ -29,25 +36,35 @@ pub struct JobSnapshot {
 pub enum JobPhase {
     Created,
     Probing,
+    Preparing,
     Transferring,
+    Pausing,
+    Paused,
     Committing,
-    Completed,
+    Restarting,
     Cancelling,
-    Failed,
+    Stopping,
 }
 
-impl From<crate::core::world::JobPhase> for JobPhase {
-    fn from(p: crate::core::world::JobPhase) -> Self {
+impl From<&crate::core::world::JobPhase> for JobPhase {
+    fn from(p: &crate::core::world::JobPhase) -> Self {
         use crate::core::world::JobPhase as P;
         match p {
             P::Created => JobPhase::Created,
             P::Probing => JobPhase::Probing,
+            P::Preparing => JobPhase::Preparing,
+            P::StoppingPreparation(crate::core::world::JobFailure::Cancelled)
+            | P::StoppingDestination(crate::core::world::JobFailure::Cancelled) => {
+                JobPhase::Cancelling
+            }
+            P::StoppingPreparation(_) | P::StoppingDestination(_) => JobPhase::Stopping,
             P::Transferring => JobPhase::Transferring,
+            P::Pausing => JobPhase::Pausing,
+            P::Paused => JobPhase::Paused,
             P::Committing => JobPhase::Committing,
-            P::Completed => JobPhase::Completed,
-            P::Cancelling => JobPhase::Cancelling,
-            P::Failing => JobPhase::Cancelling,
-            P::Failed => JobPhase::Failed,
+            P::Restarting | P::Resetting => JobPhase::Restarting,
+            P::Stopping(crate::core::world::JobFailure::Cancelled) => JobPhase::Cancelling,
+            P::Stopping(_) => JobPhase::Stopping,
         }
     }
 }
@@ -56,6 +73,8 @@ impl From<crate::core::world::JobPhase> for JobPhase {
 /// UI polling; read-only projection, never the model itself.
 #[derive(Debug, Clone)]
 pub struct EngineSnapshot {
+    pub controller: ControllerStats,
+    pub queued_jobs: usize,
     /// Jobs currently admitted and not terminal.
     pub active_jobs: usize,
     /// Live physical connections across all shards/origins.
@@ -69,4 +88,21 @@ pub struct EngineSnapshot {
     /// Transfer-memory bytes currently reserved / total budget.
     pub memory_used: u64,
     pub memory_limit: u64,
+}
+
+/// Control-plane work counts. Active time is populated only with diagnostics enabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ControllerStats {
+    pub planner_bytes_per_job: usize,
+    pub assignment_control_bytes: usize,
+    pub peak_reserved_connections: usize,
+    pub observations: u64,
+    pub allocation_passes: u64,
+    pub planner_evaluations: u64,
+    pub planner_global_limited: u64,
+    pub planner_local_limited: u64,
+    pub planner_source_limited: u64,
+    pub planner_unsettled: u64,
+    pub planner_topology_changes: u64,
+    pub active_time: std::time::Duration,
 }

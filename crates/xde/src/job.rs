@@ -12,7 +12,6 @@ pub struct Job {
     id: JobId,
     result: flume::Receiver<Result<JobOutcome>>,
     control: ControlHandle,
-    cancelled: std::sync::atomic::AtomicBool,
 }
 
 impl Job {
@@ -25,7 +24,6 @@ impl Job {
             id,
             result,
             control,
-            cancelled: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -43,18 +41,19 @@ impl Job {
 
     /// Request cancellation. The outcome resolves with `Error::Cancelled`
     /// once in-flight writes have reached a terminal state.
-    pub fn cancel(&self) {
-        if self
-            .cancelled
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        let _ = self.control.cancel(self.id);
+    pub fn cancel(&self) -> Result<()> {
+        self.control.cancel(self.id)
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    /// Stop new admissions and cancel active requests. Verified ranges remain resumable.
+    /// The snapshot reaches Paused after all active operations drain.
+    pub fn pause(&self) -> Result<()> {
+        self.control.pause(self.id, false)
+    }
+
+    /// Re-enter global admission after the paused operations have drained.
+    pub fn resume(&self) -> Result<()> {
+        self.control.pause(self.id, true)
     }
 
     pub async fn wait(self) -> Result<JobOutcome> {
@@ -102,7 +101,11 @@ impl Job {
                         if next != sig {
                             sig = next;
                             last_move = Instant::now();
-                        } else if last_move.elapsed() > stall {
+                        } else if !snap.queued
+                            && !(snap.globally_constrained && snap.active_streams == 0)
+                            && snap.phase != JobPhase::Paused
+                            && last_move.elapsed() > stall
+                        {
                             return Err(Error::Stalled {
                                 reason: format!("no progress for {stall:?}: {snap:?}"),
                             });
@@ -119,6 +122,7 @@ impl Job {
 struct ProgressSig {
     phase: Option<JobPhase>,
     verified: u64,
+    consumed: u64,
     connections: usize,
     streams: usize,
     total: Option<u64>,
@@ -129,6 +133,7 @@ impl From<&JobSnapshot> for ProgressSig {
         Self {
             phase: Some(s.phase),
             verified: s.verified_bytes,
+            consumed: s.consumed_bytes,
             connections: s.active_connections,
             streams: s.active_streams,
             total: s.total_length,

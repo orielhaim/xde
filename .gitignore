@@ -1,3 +1,4 @@
 target/
-.commandcode/
 *.log
+__pycache__/
+scripts/

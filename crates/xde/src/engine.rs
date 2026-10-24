@@ -15,7 +15,6 @@ use crate::{control::ControlCommand, control::ControlHandle, job::Job, netctx};
 pub struct EngineConfig {
     limits: EngineLimits,
     shards: usize,
-    memory_limit_bytes: u64,
     /// Expert knob: speak HTTP/2 with prior knowledge (h2c) to every
     /// plaintext origin. For benchmarks and origins explicitly configured
     /// for it; `HttpVersionPolicy::Auto` never guesses this.
@@ -31,21 +30,18 @@ pub struct EngineConfig {
 /// Threads that must be joined exactly once, whether teardown comes from an
 /// explicit `Engine::shutdown()` or the last handle dropping.
 struct RunningState {
-    runtime: crate::runtime::Runtime,
+    runtime: crate::runtime::ShardPool,
     control_thread: JoinHandle<()>,
+    resolver_thread: JoinHandle<()>,
 }
 
 impl RunningState {
-    /// Deterministic teardown. Dropping the runtime first closes every
-    /// shard-side socket and lane; joining the control thread afterwards
-    /// guarantees every job waiter has been answered before this returns.
-    /// The loop itself terminates via the shutdown command (see
-    /// `run_loop`): its own `obs_tx` clone keeps the observation channel
-    /// connected until it exits, so mailbox disconnect alone cannot be the
-    /// exit signal.
+    /// The controller drains jobs first. Closing shard ingress then lets
+    /// resident services finish cleanup before their runtimes are destroyed.
     fn join(self) {
-        drop(self.runtime);
         let _ = self.control_thread.join();
+        drop(self.runtime);
+        let _ = self.resolver_thread.join();
     }
 }
 
@@ -60,17 +56,10 @@ impl EngineInner {
     /// Cancel every active job, stop the control loop, and join all
     /// threads. Idempotent; safe from both `shutdown()` and `Drop`.
     fn terminate(&self) {
-        // Ask the loop to wind down. `Disconnected` means it already exited;
-        // a timeout means it is wedged and joining would block indefinitely,
-        // so teardown degrades to best-effort.
-        let loop_gone = matches!(
-            self.control.shutdown(),
-            Err(Error::Runtime(crate::core::RuntimeError::EngineGone))
-        );
         if let Ok(mut guard) = self.state.lock()
             && let Some(state) = guard.take()
-            && !loop_gone
         {
+            let _ = self.control.shutdown();
             state.join();
         }
     }
@@ -107,7 +96,6 @@ impl Default for EngineBuilder {
         Self(EngineConfig {
             limits: EngineLimits::default(),
             shards: 2.min(std::thread::available_parallelism().map_or(1, usize::from)),
-            memory_limit_bytes: 256 * 1024 * 1024,
             h2_prior_knowledge: false,
             danger_accept_invalid_certs: false,
             profile_path: None,
@@ -127,7 +115,7 @@ impl EngineBuilder {
     }
 
     pub fn memory_limit(mut self, bytes: u64) -> Self {
-        self.0.memory_limit_bytes = bytes.max(1);
+        self.0.limits.memory_bytes = bytes.max(1);
         self
     }
 
@@ -153,10 +141,19 @@ impl EngineBuilder {
     }
 
     pub fn build(self) -> Result<Engine> {
-        let runtime = crate::runtime::Runtime::builder()
-            .shards(self.0.shards)
-            .build()?;
-        let memory = MemoryBudget::new(self.0.memory_limit_bytes);
+        let limits = self.0.limits;
+        if limits.memory_bytes == 0
+            || limits.max_jobs == 0
+            || limits.max_physical_connections == 0
+            || limits.max_connections_per_origin == 0
+            || limits.max_active_assignments == 0
+            || limits.fair_quantum_bytes == 0
+        {
+            return Err(Error::Config(
+                "engine resource limits must be nonzero".into(),
+            ));
+        }
+        let memory = MemoryBudget::new(self.0.limits.memory_bytes);
 
         // Observation mailbox: shards and the resolver publish; the control
         // loop consumes.
@@ -178,6 +175,7 @@ impl EngineBuilder {
 
         // Resident shard service per Compio shard.
         let mut shard_txs = Vec::with_capacity(self.0.shards);
+        let mut services = Vec::with_capacity(self.0.shards);
         for shard in 0..self.0.shards {
             let (tx, rx) = flume::bounded::<crate::shard::ShardCommand>(1024);
             shard_txs.push(tx);
@@ -189,12 +187,12 @@ impl EngineBuilder {
                 memory.clone(),
                 capacity.clone(),
             );
-            runtime.handle().drive_local(shard, move || async move {
-                service.run().await;
-            })?;
+            services.push(service);
         }
 
-        let resolver = crate::resolve::ResolverHandle::spawn();
+        let runtime = crate::runtime::ShardPool::start(services, shard_txs)?;
+        let shard_txs = runtime.senders();
+        let (resolver, resolver_thread) = crate::resolve::spawn();
         // Public telemetry: one bounded channel, one logical consumer.
         // Terminal job state always travels through `Job`, never here.
         let (event_sink, event_stream) = crate::core::events::EventSink::channel();
@@ -219,6 +217,7 @@ impl EngineBuilder {
             state: std::sync::Mutex::new(Some(RunningState {
                 runtime,
                 control_thread,
+                resolver_thread,
             })),
         })))
     }
@@ -246,8 +245,8 @@ impl Engine {
     }
 
     /// Graceful shutdown: cancel every active job (journals are checkpointed
-    /// so interrupted transfers resume later), answer all waiters with
-    /// `Error::Cancelled`, stop the control loop, and join the control and
+    /// so interrupted transfers resume later), drain pending writes, let
+    /// publication already in progress finish, and join the control and
     /// shard threads. Fully synchronous: when this returns, every resource
     /// the engine owned has been released. Dropping the final `Engine`
     /// handle runs the same path; this is the explicit form.
@@ -289,12 +288,24 @@ impl Engine {
         refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
         progress: Option<crate::progress::ProgressPublisher>,
     ) -> Result<Job> {
-        let mut spec = spec;
-        spec.policy = self.0.config.limits.clamp_policy(spec.policy);
-        let destination_key = final_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("anon-{}-{}", std::process::id(), next_counter()));
+        if spec.policy.transport.max_physical_connections == 0
+            || spec.policy.transport.max_streams_per_connection == 0
+            || spec.policy.transport.max_active_assignments == 0
+        {
+            return Err(Error::Config("job transport limits must be nonzero".into()));
+        }
+        if let crate::TopologyPolicy::Fixed(target) = spec.policy.topology
+            && (target.connections == 0 || target.streams_per_connection == 0)
+        {
+            return Err(Error::Config("fixed topology must be nonzero".into()));
+        }
+        let destination_key = match (&final_path, &shared_destination) {
+            (Some(path), None) => crate::core::world::DestinationKey::File(path.clone()),
+            (None, Some(destination)) => crate::core::world::DestinationKey::Shared(
+                Arc::as_ptr(destination).cast::<()>() as usize,
+            ),
+            _ => return Err(Error::destination("exactly one destination is required")),
+        };
         let (admit_tx, admit_rx) = flume::bounded(1);
         let (result_tx, result_rx) = flume::bounded(1);
         self.0.control.submit(ControlCommand {
@@ -304,7 +315,6 @@ impl Engine {
             shared_destination,
             refresher,
             progress,
-            shutdown: false,
             admit_tx,
             result_tx,
         })?;
@@ -313,12 +323,6 @@ impl Engine {
             .map_err(|_| Error::Runtime(crate::core::RuntimeError::EngineGone))??;
         Ok(Job::new(job_id, result_rx, self.0.control.clone()))
     }
-}
-
-fn next_counter() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    N.fetch_add(1, Ordering::Relaxed)
 }
 
 pub struct DownloadBuilder {
