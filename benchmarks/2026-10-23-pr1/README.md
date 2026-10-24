@@ -8,10 +8,20 @@ It includes original labels, failed attempts and the immutable measured source
 snapshots. `bundle.py` verifies archive contents and refuses to replace evidence.
 
 `freeze.py` creates immutable baseline/candidate source trees with an identical
-benchmark harness and lockfile. Build each tree separately and copy the resulting
-executables before building the other. `record-build.py` verifies the source
-manifest and binds the executable hash to Cargo's compiler, source and dependency
-metadata. Preserve those records alongside the raw trials.
+benchmark harness, crate manifests and lockfile. Use a separate, source-bound Cargo
+target for each tree. Sharing a target across frozen paths has reused an engine
+library from another checkout while rebuilding the benchmark executable.
+`XDE_SOURCE_ID` alone cannot detect that mistake.
+
+```powershell
+python benchmarks/2026-10-23-pr1/build.py target/frozen/baseline target/build-baseline target/build-baseline.json
+python benchmarks/2026-10-23-pr1/build.py target/frozen/candidate target/build-candidate target/build-candidate.json
+```
+
+`build.py` verifies the frozen manifest and binds each target to its source path,
+manifest hash, compiler and build environment. It rejects existing unbound targets
+and mismatched bindings. `record-build.py` requires that binding and records the
+executable hash. Preserve both records with the trials.
 
 `run-control.ps1` alternates the scheduler-probe binaries. Select a small set with
 `-CaseName`, and supply the frozen `-Baseline` and `-Candidate` paths. Run without

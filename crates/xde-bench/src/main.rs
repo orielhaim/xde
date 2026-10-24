@@ -6,6 +6,8 @@ use xde_bench::{Pipeline, Proto, Trial, Validity, Workload, distribution, trial}
 struct Args {
     #[arg(long, value_enum, default_value_t = Proto::H1)]
     protocol: Proto,
+    #[arg(long, value_enum, default_value_t = xde_bench::DurabilityMode::Periodic)]
+    durability: xde_bench::DurabilityMode,
     #[arg(long, default_value_t = 256)]
     size_mib: u64,
     #[arg(long, default_value_t = 1)]
@@ -62,6 +64,7 @@ fn main() -> Result<(), String> {
     }
     let workload = Workload {
         protocol: args.protocol,
+        durability: args.durability,
         bytes: args.size_mib.checked_mul(1048576).ok_or("size overflow")?,
         connections: args.connections,
         streams: args.streams,

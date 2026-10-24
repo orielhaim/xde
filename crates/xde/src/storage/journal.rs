@@ -13,14 +13,13 @@ use serde::{Deserialize, Serialize};
 pub use crate::core::representation::{JournaledFingerprint, ValidatorMatch};
 
 const MAGIC: [u8; 8] = *b"xdeJRNL1";
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 
 // JournaledFingerprint and ValidatorMatch are canonical in
 // the core representation module and re-exported above.
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JournalPayload {
-    pub format_version: u16,
     pub fingerprint: JournaledFingerprint,
     pub completed: RangeSet,
     /// Subset of `completed` known to survive a crash.
@@ -39,7 +38,6 @@ impl JournalPayload {
     pub fn new(fingerprint: JournaledFingerprint, total: Option<u64>, overlap_bytes: u32) -> Self {
         let now = unix_now();
         Self {
-            format_version: FORMAT_VERSION,
             fingerprint,
             completed: RangeSet::new(),
             durable: RangeSet::new(),
@@ -59,11 +57,53 @@ impl JournalPayload {
 #[derive(Debug)]
 pub struct Journal {
     path: PathBuf,
-    payload: JournalPayload,
-    dirty: bool,
+    payload: Box<JournalPayload>,
+}
+
+#[derive(Clone)]
+pub(crate) struct JournalCheckpoint {
+    path: PathBuf,
+    payload: Box<JournalPayload>,
+}
+
+impl JournalCheckpoint {
+    pub(crate) fn persist_after_sync(mut self, part: &Path) -> Result<Box<JournalPayload>> {
+        let has_data = !self.payload.completed.is_empty();
+        self.persist_after(|| {
+            if has_data {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(part)
+                    .and_then(|file| file.sync_data())
+                    .map_err(|error| {
+                        Error::Persistence(crate::core::error::PersistenceError::Io(error))
+                    })?;
+            }
+            Ok(())
+        })
+    }
+
+    fn persist_after(&mut self, sync: impl FnOnce() -> Result<()>) -> Result<Box<JournalPayload>> {
+        sync()?;
+        self.payload.durable = self.payload.completed.clone();
+        Journal::persist_blocking_inner(self.path.clone(), &self.payload)?;
+        Ok(self.payload.clone())
+    }
 }
 
 impl Journal {
+    pub(crate) fn checkpoint(&self) -> JournalCheckpoint {
+        JournalCheckpoint {
+            path: self.path.clone(),
+            payload: self.payload.clone(),
+        }
+    }
+
+    pub(crate) fn acknowledge(&mut self, payload: Box<JournalPayload>) {
+        self.payload.durable = payload.durable.clone();
+    }
+
     pub fn path_for(part_path: &Path) -> PathBuf {
         let mut p = part_path.to_path_buf().into_os_string();
         p.push(".state");
@@ -73,8 +113,7 @@ impl Journal {
     pub fn create(path: PathBuf, payload: JournalPayload) -> Self {
         Self {
             path,
-            payload,
-            dirty: true,
+            payload: Box::new(payload),
         }
     }
 
@@ -120,8 +159,7 @@ impl Journal {
             postcard::from_bytes(body).map_err(|e| Error::journal(e.to_string()))?;
         Ok(Some(Self {
             path: path.to_path_buf(),
-            payload,
-            dirty: false,
+            payload: Box::new(payload),
         }))
     }
 
@@ -132,56 +170,19 @@ impl Journal {
         &self.path
     }
     pub fn payload_mut(&mut self) -> &mut JournalPayload {
-        self.dirty = true;
         &mut self.payload
-    }
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    /// Force the next `persist` to rewrite the record even if the in-memory
-    /// mutation helpers above were not used.
-    pub fn mark_dirty(&mut self) {
-        self.dirty = true;
     }
 
     pub fn record_completed(&mut self, r: crate::core::ranges::ByteRange) {
         self.payload.completed.insert(r);
         self.payload.bytes_written = self.payload.completed.covered_len();
         self.payload.updated_unix = unix_now();
-        self.dirty = true;
-    }
-
-    pub fn mark_completed_durable(&mut self) {
-        self.payload.durable = self.payload.completed.clone();
-        self.dirty = true;
-    }
-
-    pub fn invalidate(&mut self, r: crate::core::ranges::ByteRange) {
-        self.payload.completed.remove(r);
-        self.payload.durable.remove(r);
-        self.payload.bytes_written = self.payload.completed.covered_len();
-        self.dirty = true;
     }
 
     pub fn clear_ranges(&mut self) {
         self.payload.completed = RangeSet::new();
         self.payload.durable = RangeSet::new();
         self.payload.bytes_written = 0;
-        self.dirty = true;
-    }
-
-    /// Serialize + write + fsync + atomic rename on the calling thread. The
-    /// control plane calls this from its own thread; the write is small
-    /// (bounded by range count) and checkpoint-cadence limited.
-    pub fn persist_blocking(&mut self) -> Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        let path = self.path.clone();
-        Self::persist_blocking_inner(path, &self.payload)?;
-        self.dirty = false;
-        Ok(())
     }
 
     fn persist_blocking_inner(path: PathBuf, payload: &JournalPayload) -> Result<()> {
@@ -208,22 +209,20 @@ impl Journal {
         f.sync_all()
             .map_err(|e| Error::Persistence(crate::core::error::PersistenceError::Io(e)))?;
         drop(f);
-        std::fs::rename(&tmp, &path)
+        crate::storage::file::atomic_replace(&tmp, &path, true)
             .map_err(|e| Error::Persistence(crate::core::error::PersistenceError::Io(e)))?;
         sync_parent(&path)?;
         Ok(())
     }
 
-    pub async fn remove(self) -> Result<()> {
-        compio::runtime::spawn_blocking(move || match std::fs::remove_file(&self.path) {
+    pub(crate) fn remove_blocking(self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
             Ok(()) => sync_parent(&self.path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Persistence(
-                crate::core::error::PersistenceError::Io(e),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Persistence(
+                crate::core::error::PersistenceError::Io(error),
             )),
-        })
-        .await
-        .map_err(|_| Error::journal("journal remover panicked"))?
+        }
     }
 }
 
@@ -265,20 +264,63 @@ mod tests {
     }
 
     #[test]
-    fn written_ranges_are_not_crash_recoverable_until_marked_durable() {
+    fn failed_payload_flush_never_publishes_a_durable_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal");
         let mut journal = Journal::create(
-            PathBuf::from("unused"),
-            JournalPayload::new(fingerprint(), Some(8), 0),
+            path.clone(),
+            JournalPayload::new(fingerprint(), Some(16), 0),
         );
         journal.record_completed(ByteRange::new(0, 8));
-        assert_eq!(journal.payload().completed.covered_len(), 8);
+        let result = journal
+            .checkpoint()
+            .persist_after(|| Err(Error::destination("injected flush failure")));
+        assert!(result.is_err());
+        assert!(!path.exists());
         assert_eq!(journal.payload().durable.covered_len(), 0);
+    }
 
-        journal.mark_completed_durable();
+    #[test]
+    fn checkpoint_publishes_only_its_flushed_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal");
+        let part = directory.path().join("artifact.part");
+        std::fs::write(&part, [7; 16]).unwrap();
+        let mut journal = Journal::create(
+            path.clone(),
+            JournalPayload::new(fingerprint(), Some(16), 0),
+        );
+        journal.record_completed(ByteRange::new(0, 8));
+        let snapshot = journal.checkpoint();
+        journal.record_completed(ByteRange::new(8, 16));
+        let persisted = snapshot.persist_after_sync(&part).unwrap();
+        journal.acknowledge(persisted);
+        assert_eq!(journal.payload().completed.covered_len(), 16);
         assert_eq!(journal.payload().durable.covered_len(), 8);
-        journal.invalidate(ByteRange::new(2, 6));
-        for range in journal.payload().durable.iter() {
-            assert!(journal.payload().completed.contains_range(range));
-        }
+        assert_eq!(
+            Journal::load_blocking(&path)
+                .unwrap()
+                .unwrap()
+                .payload()
+                .durable
+                .covered_len(),
+            8
+        );
+    }
+    #[test]
+    fn journals_without_the_payload_flush_guarantee_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal");
+        let mut payload = JournalPayload::new(fingerprint(), Some(8), 0);
+        payload.completed.insert(ByteRange::new(0, 8));
+        payload.durable = payload.completed.clone();
+        let body = postcard::to_allocvec(&payload).unwrap();
+        let mut bytes = Vec::from(MAGIC);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&crc32c::crc32c(&body).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(Journal::load_blocking(&path).is_err());
     }
 }

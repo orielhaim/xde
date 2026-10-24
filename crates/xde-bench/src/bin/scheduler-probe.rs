@@ -16,6 +16,8 @@ enum Mode {
 struct Args {
     #[arg(long, value_enum, default_value_t = Proto::H1)]
     protocol: Proto,
+    #[arg(long, value_enum, default_value_t = xde_bench::DurabilityMode::Periodic)]
+    durability: xde_bench::DurabilityMode,
     #[arg(long, value_enum, default_value_t = Mode::Adaptive)]
     mode: Mode,
     #[arg(long, default_value_t = 1024)]
@@ -108,6 +110,7 @@ fn main() -> Result<(), String> {
     }
     let workload = Workload {
         protocol: args.protocol,
+        durability: args.durability,
         bytes: args.size_mib.checked_mul(1 << 20).ok_or("size overflow")?,
         connections: args.connections,
         streams: args.streams,
@@ -181,6 +184,7 @@ fn main() -> Result<(), String> {
         let job = engine
             .download(&fixtures[if args.shared_origin { 0 } else { i }].url)
             .policy(policy)
+            .durability(workload.durability.policy())
             .priority(if args.weighted && i == 0 {
                 Priority::Critical
             } else {

@@ -61,6 +61,7 @@ pub enum JobPhase {
     /// Custom destination initialization owns the lease until acknowledgement.
     Preparing,
     StoppingPreparation(JobFailure),
+    StoppingDestination(JobFailure),
     /// Fetching bytes.
     Transferring,
     Pausing,
@@ -69,6 +70,7 @@ pub enum JobPhase {
     Committing,
     /// Retire the current writers before replacing the representation plan.
     Restarting,
+    Resetting,
     /// The failure owns the terminal decision while outstanding I/O drains.
     Stopping(JobFailure),
 }
@@ -82,6 +84,7 @@ impl JobPhase {
                 | JobPhase::Restarting
                 | JobPhase::Pausing
                 | JobPhase::StoppingPreparation(_)
+                | JobPhase::StoppingDestination(_)
         )
     }
 }

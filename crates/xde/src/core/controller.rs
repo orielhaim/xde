@@ -32,15 +32,16 @@ use crate::core::{
 /// SegmentPlan and to judge whether previously downloaded bytes are still
 /// valid for the representation the server serves now.
 #[derive(Debug, Clone, Default)]
-pub struct ResumeEvidence {
-    /// Ranges whose bytes were durably written *and* HTTP-verified before
-    /// the previous run ended.
-    pub durable: crate::core::ranges::RangeSet,
-    pub total: Option<u64>,
-    pub etag: Option<String>,
-    pub last_modified: Option<std::time::SystemTime>,
-    /// Source URLs the previous run used (final URL included).
-    pub urls: Vec<String>,
+pub enum ResumeEvidence {
+    Ranges {
+        durable: crate::core::ranges::RangeSet,
+        total: Option<u64>,
+        etag: Option<String>,
+        last_modified: Option<std::time::SystemTime>,
+        urls: Vec<String>,
+    },
+    #[default]
+    ResetRequired,
 }
 
 /// Discovery metadata from an HTTPS/SVCB record: transport hints the engine
@@ -197,6 +198,13 @@ pub enum Observation {
         /// Read-back digest of the committed artifact, when integrity
         /// verification was requested.
         digest: Option<crate::core::spec::Digest>,
+    },
+    DestinationDrained {
+        job: JobId,
+    },
+    ResumeDataReset {
+        job: JobId,
+        result: std::result::Result<(), DestinationFailure>,
     },
     /// Destination finalize or discard failed.
     DestinationFailed {
@@ -475,6 +483,9 @@ pub enum Action {
         /// asked for no digest at all.
         integrity: Option<crate::core::spec::DigestCheck>,
     },
+    DrainDestination {
+        job: JobId,
+    },
     FailJob {
         job: JobId,
         error: JobFailure,
@@ -620,6 +631,7 @@ impl Controller {
                     j.phase,
                     JobPhase::Created
                         | JobPhase::Probing
+                        | JobPhase::Resetting
                         | JobPhase::Transferring
                         | JobPhase::Committing
                 )
@@ -627,8 +639,9 @@ impl Controller {
             .map(|(job, j)| {
                 let target = j.planner.desired();
                 let (serial, multiplexed) = ready.get(job).copied().unwrap_or_default();
-                let segmented =
-                    j.supports_ranges && crate::core::sink::supports_segmentation(j.sink_caps);
+                let segmented = j.phase == JobPhase::Transferring
+                    && j.supports_ranges
+                    && crate::core::sink::supports_segmentation(j.sink_caps);
                 let connections = match j.phase {
                     JobPhase::Committing => 0,
                     JobPhase::Transferring if segmented => u16::from(target.connections),
@@ -1798,55 +1811,48 @@ impl Controller {
                 // Strong agreement (URL + validators + length) seeds verified
                 // ranges; anything weaker re-downloads conservatively.
                 let mut seeded = crate::core::ranges::RangeSet::new();
+                let mut reset_resume = false;
                 let mut resumed_bytes = 0u64;
-                if let Some(r) = j.resume.take() {
-                    let url_ok = r.urls.last().is_some_and(|u| {
-                        Some(u.as_str()) == j.redirect_chain.last().map(|s| s.as_str())
-                    });
-                    let etag_agrees = match (&r.etag, &etag) {
-                        (Some(a), Some(b)) => a == b,
-                        (None, None) => true,
-                        _ => false,
-                    };
-                    let lm_agrees = match (&r.last_modified, &last_modified) {
-                        (Some(a), Some(b)) => a == b,
-                        (None, None) => true,
-                        _ => false,
-                    };
-                    let length_agrees = match (&r.total, &total_length) {
-                        (Some(a), Some(b)) => a == b,
-                        (None, _) => true,
-                        _ => false,
-                    };
-                    let strong_etag = etag
-                        .as_deref()
-                        .is_some_and(|e| e.starts_with('"') && !e.starts_with("W/"));
-                    let validators_ok = if strong_etag {
-                        etag_agrees
-                    } else {
-                        etag_agrees && lm_agrees
-                    };
-                    let trust_journal = url_ok
-                        && length_agrees
-                        && validators_ok
-                        && (strong_etag || !j.integrity.verify_on_resume);
-                    if trust_journal {
-                        for range in r.durable.iter() {
-                            if total_length.is_none_or(|t| range.end <= t) {
-                                seeded.insert(range);
-                                resumed_bytes += range.len();
+                match j.resume.take() {
+                    Some(ResumeEvidence::ResetRequired) => reset_resume = true,
+                    Some(ResumeEvidence::Ranges {
+                        durable,
+                        total,
+                        etag: previous_etag,
+                        last_modified: previous_modified,
+                        urls,
+                    }) => {
+                        let url_ok = urls.last().is_some_and(|url| {
+                            Some(url.as_str())
+                                == j.redirect_chain.last().map(|value| value.as_str())
+                        });
+                        let etag_agrees = previous_etag == etag;
+                        let modified_agrees = previous_modified == last_modified;
+                        let length_agrees = total.is_none() || total == total_length;
+                        let strong_etag = etag.as_deref().is_some_and(|value| {
+                            value.starts_with('"') && !value.starts_with("W/")
+                        });
+                        let validators_ok = etag_agrees && (strong_etag || modified_agrees);
+                        let trusted = !durable.is_empty()
+                            && url_ok
+                            && length_agrees
+                            && validators_ok
+                            && (strong_etag || !j.integrity.verify_on_resume);
+                        if trusted {
+                            for range in durable.iter() {
+                                if total_length.is_none_or(|length| range.end <= length) {
+                                    seeded.insert(range);
+                                    resumed_bytes += range.len();
+                                }
                             }
+                        } else {
+                            reset_resume = true;
                         }
-                    } else if url_ok
-                        && length_agrees
-                        && validators_ok
-                        && j.integrity.verify_on_resume
-                    {
-                        // Weak/missing validators: keep bytes on disk but
-                        // re-fetch so overlap verification can confirm them.
-                    } else {
-                        actions.push(Action::ResetResumeData { job });
                     }
+                    None => {}
+                }
+                if reset_resume {
+                    actions.push(Action::ResetResumeData { job });
                 }
                 j.resumed_bytes = resumed_bytes;
                 let mut plan = crate::core::segment::SegmentPlan::new(
@@ -1871,7 +1877,11 @@ impl Controller {
                 let already_complete = plan.is_complete();
                 j.plan_id.advance();
                 j.plan = Some(plan);
-                j.phase = JobPhase::Transferring;
+                j.phase = if reset_resume {
+                    JobPhase::Resetting
+                } else {
+                    JobPhase::Transferring
+                };
                 let origin = j.origin;
                 let requires_h3 =
                     j.policy.http_version == crate::core::policy::HttpVersionPolicy::Http3Only;
@@ -1925,30 +1935,8 @@ impl Controller {
                 self.scale_connections(&mut actions, Some(origin), now);
                 self.ensure_probes(&mut actions, origin, now);
                 self.start_adaptive(&mut actions, origin, now);
-                if already_complete && let Some(j) = self.world.jobs.get_mut(job) {
-                    j.phase = JobPhase::Committing;
-                    let len = j
-                        .plan
-                        .as_ref()
-                        .and_then(|p| p.total())
-                        .or(j.total_length)
-                        .unwrap_or(0);
-                    let integrity = match (j.integrity.expected, j.integrity.compute) {
-                        (Some(exp), _) => Some(crate::core::spec::DigestCheck {
-                            kind: exp.kind(),
-                            expected: Some(*exp.bytes()),
-                        }),
-                        (None, Some(kind)) => Some(crate::core::spec::DigestCheck {
-                            kind,
-                            expected: None,
-                        }),
-                        (None, None) => None,
-                    };
-                    actions.push(Action::CommitDestination {
-                        job,
-                        final_length: len,
-                        integrity,
-                    });
+                if already_complete && !reset_resume {
+                    self.begin_commit(&mut actions, job);
                 }
                 return actions;
             }
@@ -2087,31 +2075,8 @@ impl Controller {
                 {
                     plan.on_response_verified(assignment, range, now);
                     plan.finish_verified(assignment);
-                    let complete = plan.is_complete();
-                    let total = plan.total();
-                    if complete {
-                        j.phase = JobPhase::Committing;
-                        let len = total.unwrap_or_else(|| plan.bytes_done());
-                        // What the commit must prove: expected digest wins,
-                        // otherwise a compute-only request.
-                        let integrity = match (j.integrity.expected, j.integrity.compute) {
-                            (Some(exp), _) => Some(crate::core::spec::DigestCheck {
-                                kind: exp.kind(),
-                                expected: Some(*exp.bytes()),
-                            }),
-                            (None, Some(kind)) => Some(crate::core::spec::DigestCheck {
-                                kind,
-                                expected: None,
-                            }),
-                            (None, None) => None,
-                        };
-                        actions.push(Action::CommitDestination {
-                            job,
-                            final_length: len,
-                            integrity,
-                        });
-                    }
                 }
+                self.begin_commit(&mut actions, job);
                 if self
                     .world
                     .jobs
@@ -2224,6 +2189,40 @@ impl Controller {
                 digest,
             } => self.complete_committed_job(&mut actions, job, final_length, digest),
 
+            Observation::DestinationDrained { job } => {
+                if let Some(j) = self.world.jobs.get(job)
+                    && let JobPhase::StoppingDestination(error) = j.phase.clone()
+                {
+                    self.remove_job(&mut actions, job);
+                    actions.push(Action::FailJob { job, error });
+                }
+            }
+
+            Observation::ResumeDataReset { job, result } => {
+                if self
+                    .world
+                    .jobs
+                    .get(job)
+                    .is_none_or(|j| j.phase != JobPhase::Resetting)
+                {
+                    return actions;
+                }
+                if let Err(failure) = result {
+                    self.begin_fail(
+                        &mut actions,
+                        job,
+                        format!("resume journal reset failed: {:?}", failure.kind).into(),
+                    );
+                } else {
+                    let j = self.world.jobs.get_mut(job).expect("resetting job exists");
+                    j.phase = JobPhase::Transferring;
+                    let origin = j.origin;
+                    actions.push(Action::ResetTransfer { job });
+                    self.begin_commit(&mut actions, job);
+                    self.start_adaptive(&mut actions, origin, now);
+                }
+            }
+
             Observation::DestinationFailed { job, failure } => {
                 let message = match failure.kind {
                     crate::core::controller::DestinationFailureKind::DigestMismatch => {
@@ -2233,7 +2232,7 @@ impl Controller {
                         "destination has no space left".to_string()
                     }
                     crate::core::controller::DestinationFailureKind::DestinationError => {
-                        "destination failed during commit".to_string()
+                        "destination finalization or checkpoint failed".to_string()
                     }
                 };
                 if self
@@ -2271,6 +2270,9 @@ impl Controller {
                 let Some(j) = self.world.jobs.get_mut(job) else {
                     return actions;
                 };
+                if !matches!(j.phase, JobPhase::Probing | JobPhase::Transferring) {
+                    return actions;
+                }
                 j.refresh_attempts += 1;
                 let Some(source_id) = j.active_source() else {
                     return actions;
@@ -2308,6 +2310,14 @@ impl Controller {
             }
 
             Observation::CredentialRefreshFailed { job, status } => {
+                if self
+                    .world
+                    .jobs
+                    .get(job)
+                    .is_none_or(|j| !matches!(j.phase, JobPhase::Probing | JobPhase::Transferring))
+                {
+                    return actions;
+                }
                 self.begin_fail(
                     &mut actions,
                     job,
@@ -4016,7 +4026,10 @@ impl Controller {
         }
         if matches!(
             j.phase,
-            JobPhase::Stopping(_) | JobPhase::StoppingPreparation(_) | JobPhase::Committing
+            JobPhase::Stopping(_)
+                | JobPhase::StoppingPreparation(_)
+                | JobPhase::StoppingDestination(_)
+                | JobPhase::Committing
         ) {
             return;
         }
@@ -4033,7 +4046,12 @@ impl Controller {
         let Some(j) = self.world.jobs.get(job) else {
             return;
         };
-        if !j.phase.is_draining() || matches!(j.phase, JobPhase::StoppingPreparation(_)) {
+        if !j.phase.is_draining()
+            || matches!(
+                j.phase,
+                JobPhase::StoppingPreparation(_) | JobPhase::StoppingDestination(_)
+            )
+        {
             return;
         }
         let in_flight = j.plan.as_ref().map_or(0, |p| p.in_flight());
@@ -4048,8 +4066,8 @@ impl Controller {
         }
         match j.phase.clone() {
             JobPhase::Stopping(error) => {
-                self.remove_job(actions, job);
-                actions.push(Action::FailJob { job, error });
+                self.world.jobs[job].phase = JobPhase::StoppingDestination(error);
+                actions.push(Action::DrainDestination { job });
             }
             JobPhase::Pausing => {
                 let j = &mut self.world.jobs[job];
@@ -4059,7 +4077,7 @@ impl Controller {
                 actions.push(Action::ResetTransfer { job });
             }
             JobPhase::Restarting => {
-                let j = self.world.jobs.get_mut(job).expect("drained job exists");
+                let j = &mut self.world.jobs[job];
                 j.plan_id.advance();
                 let mut plan = crate::core::segment::SegmentPlan::new(
                     j.total_length,
@@ -4072,11 +4090,8 @@ impl Controller {
                 j.plan = Some(plan);
                 j.resumed_bytes = 0;
                 j.supports_ranges = false;
-                j.phase = JobPhase::Transferring;
-                let origin = j.origin;
-                actions.push(Action::ResetTransfer { job });
+                j.phase = JobPhase::Resetting;
                 actions.push(Action::ResetResumeData { job });
-                let _ = origin;
             }
             _ => unreachable!("only draining jobs can finish a drain"),
         }
@@ -4107,6 +4122,34 @@ impl Controller {
             return;
         }
         self.retry_resolve(actions, job, now);
+    }
+
+    fn begin_commit(&mut self, actions: &mut Vec<Action>, job: JobId) {
+        let Some(j) = self.world.jobs.get_mut(job) else {
+            return;
+        };
+        let Some(plan) = &j.plan else { return };
+        if j.phase != JobPhase::Transferring || !plan.is_complete() {
+            return;
+        }
+        let final_length = plan.total().unwrap_or_else(|| plan.bytes_done());
+        let integrity = match (j.integrity.expected, j.integrity.compute) {
+            (Some(expected), _) => Some(crate::core::spec::DigestCheck {
+                kind: expected.kind(),
+                expected: Some(*expected.bytes()),
+            }),
+            (None, Some(kind)) => Some(crate::core::spec::DigestCheck {
+                kind,
+                expected: None,
+            }),
+            (None, None) => None,
+        };
+        j.phase = JobPhase::Committing;
+        actions.push(Action::CommitDestination {
+            job,
+            final_length,
+            integrity,
+        });
     }
 
     fn complete_committed_job(

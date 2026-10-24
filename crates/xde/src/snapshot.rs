@@ -53,15 +53,16 @@ impl From<&crate::core::world::JobPhase> for JobPhase {
             P::Created => JobPhase::Created,
             P::Probing => JobPhase::Probing,
             P::Preparing => JobPhase::Preparing,
-            P::StoppingPreparation(crate::core::world::JobFailure::Cancelled) => {
+            P::StoppingPreparation(crate::core::world::JobFailure::Cancelled)
+            | P::StoppingDestination(crate::core::world::JobFailure::Cancelled) => {
                 JobPhase::Cancelling
             }
-            P::StoppingPreparation(_) => JobPhase::Stopping,
+            P::StoppingPreparation(_) | P::StoppingDestination(_) => JobPhase::Stopping,
             P::Transferring => JobPhase::Transferring,
             P::Pausing => JobPhase::Pausing,
             P::Paused => JobPhase::Paused,
             P::Committing => JobPhase::Committing,
-            P::Restarting => JobPhase::Restarting,
+            P::Restarting | P::Resetting => JobPhase::Restarting,
             P::Stopping(crate::core::world::JobFailure::Cancelled) => JobPhase::Cancelling,
             P::Stopping(_) => JobPhase::Stopping,
         }

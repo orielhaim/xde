@@ -42,6 +42,12 @@ use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 /// destination handle has no meaningful debug rendering and must never be
 /// logged.
 pub enum ShardCommand {
+    Checkpoint {
+        job: JobId,
+        id: u64,
+        work: Arc<crate::control::checkpoint::Work>,
+        completed: Sender<crate::control::checkpoint::Completed>,
+    },
     OpenConnection {
         connection: ConnectionId,
         target: ConnectTarget,
@@ -156,6 +162,7 @@ pub enum ShardCommand {
         integrity: Option<crate::core::spec::DigestCheck>,
         durability: crate::core::spec::Durability,
         lanes_closed: Vec<Receiver<()>>,
+        journal: crate::storage::Journal,
     },
 }
 
@@ -994,6 +1001,25 @@ impl ShardService {
                     }
                 }
 
+                ShardCommand::Checkpoint {
+                    job,
+                    id,
+                    work,
+                    completed,
+                } => {
+                    tasks.push(compio::runtime::spawn(async move {
+                        let result = std::panic::AssertUnwindSafe(work.run())
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(Error::journal("checkpoint operation panicked"))
+                            });
+                        let _ = completed
+                            .send_async(crate::control::checkpoint::Completed { job, id, result })
+                            .await;
+                    }));
+                }
+
                 ShardCommand::CommitDestination {
                     job,
                     part_path,
@@ -1001,6 +1027,7 @@ impl ShardService {
                     final_length,
                     integrity,
                     durability,
+                    journal,
                     lanes_closed,
                 } => {
                     lanes.remove(&part_path.to_string_lossy().into_owned());
@@ -1016,7 +1043,7 @@ impl ShardService {
                                     })?;
                                 }
                                 coordinator
-                                    .finalize(final_length, integrity, durability)
+                                    .finalize(final_length, integrity, durability, journal)
                                     .await
                             }
                             .await;
@@ -1536,11 +1563,13 @@ impl LaneSink {
             .await?;
         self.stats.capacity_acquire += capacity_started.elapsed();
         self.stats.capacity_wait += guard.waited();
-        let write_started = std::time::Instant::now();
-        let (batch, range) = self.lane.flush_batch(batch).await?;
-        if self.lane.is_file() {
-            self.stats.write_await += write_started.elapsed();
-        }
+        let (batch, range) = if self.lane.is_file() {
+            self.stats
+                .observe_write(self.lane.flush_batch(batch))
+                .await?
+        } else {
+            self.lane.flush_batch(batch).await?
+        };
         self.stats.operations += 1;
         self.stats.bytes += range.len();
         drop(guard);
@@ -1632,10 +1661,12 @@ impl ChunkSink for LaneSink {
             .await?;
         self.stats.capacity_acquire += capacity_started.elapsed();
         self.stats.capacity_wait += guard.waited();
-        let write_started = std::time::Instant::now();
-        self.lane.write_chunk(chunk).await?;
         if self.lane.is_file() {
-            self.stats.write_await += write_started.elapsed();
+            self.stats
+                .observe_write(self.lane.write_chunk(chunk))
+                .await?;
+        } else {
+            self.lane.write_chunk(chunk).await?;
         }
         self.stats.operations += 1;
         self.stats.bytes += n as u64;
@@ -1940,6 +1971,9 @@ impl ChunkSink for SharedSink<'_> {
         #[cfg(feature = "diagnostics")]
         if let Some(sink) = self.diagnostic.as_mut() {
             return sink.finish().await;
+        }
+        if self.context.durability() == crate::Durability::CrashSafe {
+            self.dest.flush_dyn(FlushLevel::Data).await?;
         }
         Ok(())
     }

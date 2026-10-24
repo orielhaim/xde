@@ -235,6 +235,7 @@ impl FileDestinationCoordinator {
         final_length: u64,
         check: Option<DigestCheck>,
         durability: crate::core::spec::Durability,
+        journal: crate::storage::Journal,
     ) -> Result<Option<crate::core::spec::Digest>> {
         let Self {
             final_path,
@@ -276,46 +277,16 @@ impl FileDestinationCoordinator {
             };
             drop(f);
 
-            #[cfg(windows)]
-            {
-                use std::os::windows::ffi::OsStrExt;
-                // MoveFileExW with MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH:
-                // atomic replace of an existing destination without a racy
-                // remove/rename pair, with write-through so the metadata hit
-                // the disk before we report success.
-                let to_wide = |p: &Path| -> Vec<u16> {
-                    p.as_os_str()
-                        .encode_wide()
-                        .chain(std::iter::once(0))
-                        .collect()
-                };
-                let from = to_wide(&part_path);
-                let to = to_wide(&final_path);
-                // SAFETY: both pointers are NUL-terminated wide strings for
-                // the duration of the call; MoveFileExW does not retain them.
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-                        from.as_ptr(),
-                        to.as_ptr(),
-                        windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
-                            | if matches!(durability, crate::core::spec::Durability::CrashSafe) {
-                                windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH
-                            } else {
-                                0
-                            },
-                    )
-                };
-                if ok == 0 {
-                    return Err(Error::Destination(DestinationError::Io(
-                        std::io::Error::last_os_error(),
-                    )));
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                std::fs::rename(&part_path, &final_path)
-                    .map_err(|e| Error::Destination(DestinationError::Io(e)))?;
-            }
+            // Remove recovery metadata while the destination lease is still held.
+            // Publication must not leave a journal that can seed a later artifact.
+            journal.remove_blocking()?;
+
+            crate::storage::file::atomic_replace(
+                &part_path,
+                &final_path,
+                matches!(durability, crate::Durability::CrashSafe),
+            )
+            .map_err(|error| Error::Destination(DestinationError::Io(error)))?;
             if matches!(durability, crate::core::spec::Durability::CrashSafe) {
                 sync_parent_dir(&final_path)?;
             }

@@ -16,12 +16,18 @@ use xde_test::{
 struct MemorySink {
     buf: Mutex<Vec<u8>>,
     write_gate: Option<Gate>,
+    write_gate_after: Option<u64>,
     commit_gate: Option<Gate>,
     fail_commit: bool,
     panic_write: bool,
     fail_begin: bool,
     begin_gate: Option<Gate>,
     began: std::sync::atomic::AtomicBool,
+    flush_gate: Option<Gate>,
+    flush_calls: std::sync::atomic::AtomicUsize,
+    commit_calls: std::sync::atomic::AtomicUsize,
+    fail_flush: bool,
+    panic_flush: bool,
 }
 
 struct Gate {
@@ -72,12 +78,18 @@ impl MemorySink {
         Arc::new(Self {
             buf: Mutex::new(Vec::new()),
             write_gate: None,
+            write_gate_after: None,
             commit_gate: None,
             fail_commit: false,
             panic_write: false,
             fail_begin: false,
             begin_gate: None,
             began: std::sync::atomic::AtomicBool::new(false),
+            flush_gate: None,
+            flush_calls: std::sync::atomic::AtomicUsize::new(0),
+            commit_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_flush: false,
+            panic_flush: false,
         })
     }
 }
@@ -102,7 +114,11 @@ impl RandomAccessDestination for MemorySink {
     async fn write_chunk(&self, chunk: TransferChunk) -> xde::Result<WriteCompletion> {
         assert!(self.began.load(std::sync::atomic::Ordering::Acquire));
         assert!(!self.panic_write, "injected destination panic");
-        if let Some(gate) = &self.write_gate {
+        if let Some(gate) = &self.write_gate
+            && self
+                .write_gate_after
+                .is_none_or(|offset| chunk.offset() >= offset)
+        {
             gate.wait().await;
         }
         let offset = chunk.offset() as usize;
@@ -125,11 +141,27 @@ impl RandomAccessDestination for MemorySink {
         Ok(())
     }
 
-    async fn flush(&self, _level: FlushLevel) -> xde::Result<()> {
+    async fn flush(&self, level: FlushLevel) -> xde::Result<()> {
+        let first = self
+            .flush_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            == 0;
+        if first && let Some(gate) = &self.flush_gate {
+            gate.wait().await;
+        }
+        assert!(
+            level != FlushLevel::Data || !first || !self.panic_flush,
+            "injected checkpoint panic"
+        );
+        if level == FlushLevel::Data && first && self.fail_flush {
+            return Err(xde::Error::destination("injected checkpoint failure"));
+        }
         Ok(())
     }
 
     async fn commit(&self, _outcome: CommitOutcome) -> xde::Result<()> {
+        self.commit_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(gate) = &self.commit_gate {
             gate.wait().await;
         }
@@ -560,4 +592,166 @@ fn one_custom_destination_has_one_active_lease() {
         rejected,
         "the same destination Arc cannot initialize two jobs concurrently"
     );
+}
+
+#[test]
+fn pending_checkpoint_keeps_its_lease_and_does_not_block_another_job() {
+    let spec = FixtureSpec::small();
+    let server = spawn_h1(spec.clone());
+    let engine = test_engine();
+    let mut sink = MemorySink::new();
+    let (flush_gate, control) = gate();
+    Arc::get_mut(&mut sink).unwrap().flush_gate = Some(flush_gate);
+    let job = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .durability(xde::Durability::Periodic(std::time::Duration::from_secs(
+            60,
+        )))
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    control.wait();
+    assert_eq!(
+        sink.commit_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(
+        engine
+            .download(server.url())
+            .destination(sink.clone())
+            .policy(conservative_policy())
+            .start()
+            .is_err()
+    );
+    let env = DownloadEnv::new();
+    let other = engine
+        .download(server.url())
+        .to(&env.path)
+        .durability(xde::Durability::Relaxed)
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    assert_eq!(wait_job(other).unwrap().bytes, spec.size);
+    assert_bytes_match(&env.path, spec.size);
+    assert_eq!(
+        sink.commit_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    drop(control);
+    assert_eq!(wait_job(job).unwrap().bytes, spec.size);
+    assert_eq!(*sink.buf.lock(), payload::bytes(spec.size as usize));
+    assert_eq!(
+        sink.commit_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[rstest::rstest]
+#[case::error(false)]
+#[case::panic(true)]
+fn failed_checkpoint_cannot_publish_and_releases_its_lease(#[case] panic: bool) {
+    let server = spawn_h1(FixtureSpec::small());
+    let mut sink = MemorySink::new();
+    let state = Arc::get_mut(&mut sink).unwrap();
+    state.fail_flush = !panic;
+    state.panic_flush = panic;
+    let engine = test_engine();
+    let job = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .durability(xde::Durability::Periodic(std::time::Duration::from_secs(
+            60,
+        )))
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    assert!(wait_job(job).is_err());
+    assert_eq!(
+        sink.commit_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    let replacement = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .durability(xde::Durability::Relaxed)
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    assert_eq!(
+        wait_job(replacement).unwrap().bytes,
+        FixtureSpec::small().size
+    );
+    assert_eq!(
+        sink.commit_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    engine.shutdown().unwrap();
+    server.shutdown();
+}
+
+#[test]
+fn cancellation_drains_an_inflight_checkpoint_without_blocking_other_jobs() {
+    let spec = FixtureSpec::small().with_size(4 << 20);
+    let server = spawn_h1(spec.clone());
+    let engine = test_engine();
+    let mut sink = MemorySink::new();
+    let (write_gate, write_control) = gate();
+    let (flush_gate, flush_control) = gate();
+    let state = Arc::get_mut(&mut sink).unwrap();
+    state.write_gate = Some(write_gate);
+    state.write_gate_after = Some(1 << 20);
+    state.flush_gate = Some(flush_gate);
+    let mut policy = conservative_policy();
+    policy.segmentation.min_piece = 1 << 20;
+    policy.segmentation.max_piece = 1 << 20;
+    let job = engine
+        .download(server.url())
+        .destination(sink.clone())
+        .durability(xde::Durability::Periodic(std::time::Duration::ZERO))
+        .policy(policy)
+        .start()
+        .unwrap();
+    write_control.wait();
+    flush_control.wait();
+    job.cancel().unwrap();
+    assert_eq!(job.snapshot().unwrap().phase, xde::JobPhase::Cancelling);
+    assert!(
+        engine
+            .download(server.url())
+            .destination(sink.clone())
+            .policy(conservative_policy())
+            .start()
+            .is_err()
+    );
+    let env = DownloadEnv::new();
+    let other = engine
+        .download(server.url())
+        .to(&env.path)
+        .durability(xde::Durability::Relaxed)
+        .policy(conservative_policy())
+        .start()
+        .unwrap();
+    assert_eq!(wait_job(other).unwrap().bytes, spec.size);
+    assert_bytes_match(&env.path, spec.size);
+    let (done, result) = flume::bounded(1);
+    let waiter = std::thread::spawn(move || done.send(job.wait_blocking()).unwrap());
+    drop(write_control);
+    assert!(result.try_recv().is_err());
+    drop(flush_control);
+    assert!(matches!(
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap(),
+        Err(xde::Error::Cancelled)
+    ));
+    waiter.join().unwrap();
+    assert_eq!(
+        sink.commit_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    engine.shutdown().unwrap();
+    server.shutdown();
 }

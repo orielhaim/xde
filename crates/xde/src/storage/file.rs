@@ -36,3 +36,45 @@ pub fn journal_path_for(final_path: &Path) -> PathBuf {
     s.push(".state");
     PathBuf::from(s)
 }
+
+#[cfg(windows)]
+pub(crate) fn atomic_replace(
+    source: &Path,
+    destination: &Path,
+    durable: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let source = wide(source);
+    let destination = wide(destination);
+    // SAFETY: both NUL-terminated path buffers remain live for the synchronous call.
+    let ok = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn atomic_replace(
+    source: &Path,
+    destination: &Path,
+    _durable: bool,
+) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}

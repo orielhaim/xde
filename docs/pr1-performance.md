@@ -1,5 +1,10 @@
 # PR #1 performance investigation
 
+See the [checkpoint and provenance follow-up](checkpoint-performance.md) before
+interpreting file-path results. Periodic recovery work was part of those paths.
+A new diagnostic cohort also exposed unsafe shared-target build provenance.
+Historical raw labels are preserved; the follow-up qualifies attribution separately.
+
 ## Scope and baseline
 
 The comparison baseline is PR head `218a89f`. Its source archive, release

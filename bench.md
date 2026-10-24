@@ -9,6 +9,12 @@ effective capacity/range corrections, matched regression pilots, H3 sender CPU
 attribution and controlled packet-delay measurements. Its [raw evidence](benchmarks/2026-10-23-pr1/raw.zip)
 includes source/build manifests and failed diagnostic attempts.
 
+The [checkpoint investigation](docs/checkpoint-performance.md) separates buffered
+writes from recovery durability. Specify `--durability relaxed`, `periodic` or
+`crash-safe`; the default is periodic. A/E comparisons must report this choice.
+Use Relaxed for a buffered-write comparison with curl, which does not implement
+XDE's recovery journal contract.
+
 ## Timing and eligibility
 
 - XDE job timing runs from public `start()` through committed completion.

@@ -57,9 +57,28 @@ impl Pipeline {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityMode {
+    Relaxed,
+    #[default]
+    Periodic,
+    CrashSafe,
+}
+impl DurabilityMode {
+    pub fn policy(self) -> xde::Durability {
+        match self {
+            Self::Relaxed => xde::Durability::Relaxed,
+            Self::Periodic => xde::Durability::Periodic(Duration::from_secs(2)),
+            Self::CrashSafe => xde::Durability::CrashSafe,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Workload {
     pub protocol: Proto,
+    pub durability: DurabilityMode,
     pub bytes: u64,
     pub connections: u8,
     pub streams: u16,
@@ -163,6 +182,11 @@ pub struct RequestEvidence {
     pub next_pending_seconds: f64,
     pub io_reads_submitted: u64,
     pub io_reads_completed: u64,
+    pub write_first_ready: u64,
+    pub write_first_pending: u64,
+    pub write_first_poll_seconds: f64,
+    pub write_max_first_poll_seconds: f64,
+    pub write_max_await_seconds: f64,
 }
 
 #[derive(Serialize)]
@@ -288,7 +312,10 @@ pub fn run_xde_stage(
     let events = engine.events();
     let monitor = load::Monitor::start();
     let start = Instant::now();
-    let download = engine.download(url).policy(workload.policy());
+    let download = engine
+        .download(url)
+        .policy(workload.policy())
+        .durability(workload.durability.policy());
     let download = if let Some(stage) = pipeline.diagnostic() {
         download.destination(std::sync::Arc::new(xde::diagnostics::DiscardDestination(
             stage,
@@ -423,6 +450,18 @@ pub fn collect_events(events: xde::EventStream, reference: Instant) -> Transport
                     next_pending_seconds: sample.next_pending.as_secs_f64(),
                     io_reads_submitted: sample.io_reads_submitted,
                     io_reads_completed: sample.io_reads_completed,
+                    write_first_ready: sample.destination.write_poll.first_ready,
+                    write_first_pending: sample.destination.write_poll.first_pending,
+                    write_first_poll_seconds: sample
+                        .destination
+                        .write_poll
+                        .first_poll
+                        .as_secs_f64(),
+                    write_max_first_poll_seconds: sample.destination.write_poll.max_first_poll_ns
+                        as f64
+                        / 1e9,
+                    write_max_await_seconds: sample.destination.write_poll.max_await_ns as f64
+                        / 1e9,
                 });
                 evidence.assignments_finished += 1;
                 evidence.response_validated_bytes += range.len();
@@ -741,6 +780,7 @@ mod pipeline_tests {
         ] {
             let workload = Workload {
                 protocol,
+                durability: DurabilityMode::Relaxed,
                 bytes: 4 * 1048576,
                 connections: 1,
                 streams,

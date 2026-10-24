@@ -6,6 +6,8 @@
 //! returned actions. All scheduling intelligence lives in `crate::core::controller`;
 //! this file is routing and I/O glue only.
 
+pub(crate) mod checkpoint;
+
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -77,10 +79,7 @@ struct JobState {
     context: JobContext,
     destination: DestinationState,
     part_path: PathBuf,
-    /// This destination's crash-recovery journal, loaded at admission and
-    /// updated as verified ranges arrive. Persisted per the durability
-    /// policy; removed on successful commit.
-    journal: Option<Journal>,
+    checkpoints: checkpoint::Checkpoints,
     /// Application-provided credential refresher, if any.
     refresher: Option<std::sync::Arc<dyn crate::core::credentials::SourceRefresher>>,
     progress: Option<crate::progress::ProgressPublisher>,
@@ -88,9 +87,29 @@ struct JobState {
 }
 
 enum DestinationState {
-    File(FileDestinationCoordinator),
+    File(Box<FileState>),
     Custom(Arc<dyn crate::storage::DynDestination + Send + Sync>),
     Committing,
+}
+
+struct FileState {
+    coordinator: FileDestinationCoordinator,
+    journal: Journal,
+}
+
+impl DestinationState {
+    fn journal(&self) -> Option<&Journal> {
+        match self {
+            Self::File(file) => Some(&file.journal),
+            _ => None,
+        }
+    }
+    fn journal_mut(&mut self) -> Option<&mut Journal> {
+        match self {
+            Self::File(file) => Some(&mut file.journal),
+            _ => None,
+        }
+    }
 }
 
 /// Handle held by the public Engine.
@@ -183,17 +202,26 @@ impl ControlHandle {
         reply_rx.recv().ok()
     }
 }
-struct Cleanup {
+struct DeferredDispatch {
     shard: usize,
-    command: CleanupCommand,
+    command: DeferredCommand,
 }
 
 #[derive(Clone)]
-enum CleanupCommand {
-    Release { job: JobId, part_path: PathBuf },
+enum DeferredCommand {
+    Release {
+        job: JobId,
+        part_path: PathBuf,
+    },
     Close(ConnectionId),
+    Checkpoint {
+        job: JobId,
+        id: u64,
+        work: Arc<checkpoint::Work>,
+        completed: Sender<checkpoint::Completed>,
+    },
 }
-impl CleanupCommand {
+impl DeferredCommand {
     fn command(&self) -> ShardCommand {
         match self {
             Self::Release { job, part_path } => ShardCommand::ReleaseJob {
@@ -203,17 +231,29 @@ impl CleanupCommand {
             Self::Close(connection) => ShardCommand::CloseConnection {
                 connection: *connection,
             },
+            Self::Checkpoint {
+                job,
+                id,
+                work,
+                completed,
+            } => ShardCommand::Checkpoint {
+                job: *job,
+                id: *id,
+                work: work.clone(),
+                completed: completed.clone(),
+            },
         }
     }
 }
 
 struct Loop {
-    cleanup: VecDeque<Cleanup>,
+    deferred_dispatch: VecDeque<DeferredDispatch>,
     controller: Controller,
     pending: VecDeque<Observation>,
     timers: TimerQueue,
     jobs: HashMap<JobId, JobState>,
     obs_tx: Sender<Observation>,
+    checkpoint_tx: Sender<checkpoint::Completed>,
     shard_txs: Vec<Sender<ShardCommand>>,
     status_rx: flume::Receiver<StatusRequest>,
     memory: crate::storage::MemoryBudget,
@@ -309,15 +349,15 @@ fn run_loop(args: LoopArgs) {
         memory,
         profile_path,
     } = args;
+    let (checkpoint_tx, checkpoint_rx) = flume::bounded(64);
     let mut lp = Loop {
         controller: Controller::with_shards(shards),
         pending: VecDeque::new(),
-        cleanup: VecDeque::new(),
+        deferred_dispatch: VecDeque::new(),
         timers: TimerQueue::new(),
         jobs: HashMap::new(),
-        // The loop holds no clone of obs_tx: dropping the engine disconnects
-        // this receiver, which is the shutdown signal.
         obs_tx,
+        checkpoint_tx,
         shard_txs,
         resolver,
         events,
@@ -342,11 +382,12 @@ fn run_loop(args: LoopArgs) {
         Cancel(std::result::Result<(JobId, Sender<()>), flume::RecvError>),
         Status(std::result::Result<StatusRequest, flume::RecvError>),
         Observation(std::result::Result<Observation, flume::RecvError>),
-        Cleanup(usize),
+        Dispatch(usize, std::result::Result<(), flume::SendError<()>>),
+        Checkpoint(std::result::Result<checkpoint::Completed, flume::RecvError>),
     }
     let mut shutdown = false;
     loop {
-        if shutdown && lp.jobs.is_empty() && lp.cleanup.is_empty() {
+        if shutdown && lp.jobs.is_empty() && lp.deferred_dispatch.is_empty() {
             break;
         }
         let input = if let Some(observation) = lp.pending.pop_front() {
@@ -356,9 +397,10 @@ fn run_loop(args: LoopArgs) {
                 .recv(&cmd_rx, Input::Command)
                 .recv(&cancel_rx, Input::Cancel)
                 .recv(&lp.status_rx, Input::Status)
-                .recv(&obs_rx, Input::Observation);
+                .recv(&obs_rx, Input::Observation)
+                .recv(&checkpoint_rx, Input::Checkpoint);
             let mut selected = vec![false; lp.shard_txs.len()];
-            for (index, cleanup) in lp.cleanup.iter().enumerate() {
+            for (index, cleanup) in lp.deferred_dispatch.iter().enumerate() {
                 if selected[cleanup.shard] {
                     continue;
                 }
@@ -366,7 +408,7 @@ fn run_loop(args: LoopArgs) {
                 selector = selector.send(
                     &lp.shard_txs[cleanup.shard],
                     cleanup.command.command(),
-                    move |_| Input::Cleanup(index),
+                    move |result| Input::Dispatch(index, result.map_err(|_| flume::SendError(()))),
                 );
             }
             if let Some(deadline) = lp.timers.next_deadline() {
@@ -376,8 +418,25 @@ fn run_loop(args: LoopArgs) {
             }
         };
         match input {
-            Some(Input::Cleanup(index)) => {
-                lp.cleanup.remove(index);
+            Some(Input::Checkpoint(Ok(completion))) => checkpoint::complete(&mut lp, completion),
+            Some(Input::Checkpoint(Err(_))) => unreachable!("control owns checkpoint ingress"),
+            Some(Input::Dispatch(index, result)) => {
+                let pending = lp
+                    .deferred_dispatch
+                    .remove(index)
+                    .expect("selected dispatch exists");
+                if result.is_err()
+                    && let DeferredCommand::Checkpoint { job, id, .. } = pending.command
+                {
+                    checkpoint::complete(
+                        &mut lp,
+                        checkpoint::Completed {
+                            job,
+                            id,
+                            result: Err(Error::journal("checkpoint shard disconnected")),
+                        },
+                    );
+                }
             }
 
             Some(Input::Command(Ok(ControlRequest::Pause { job, reply }))) => {
@@ -493,7 +552,7 @@ fn run_loop(args: LoopArgs) {
         }
         for event in lp.timers.drain_expired(Instant::now()) {
             if let crate::core::timers::TimerEvent::CheckpointDue(job) = &event {
-                checkpoint_journal(&mut lp, *job);
+                checkpoint::due(&mut lp, *job, Instant::now());
             }
             let actions = lp
                 .controller
@@ -556,8 +615,8 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
     };
 
     let spec = *cmd.spec;
-    if lp.controller.world.jobs.len() >= lp.controller.max_jobs()
-        || lp.cleanup.len() >= lp.controller.max_jobs().saturating_mul(lp.shard_txs.len())
+    if lp.jobs.len() >= lp.controller.max_jobs()
+        || lp.deferred_dispatch.len() >= lp.controller.max_jobs().saturating_mul(lp.shard_txs.len())
     {
         let msg = "engine job limit reached".to_string();
         let _ = cmd.admit_tx.send(Err(Error::destination(msg.clone())));
@@ -591,21 +650,40 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
 
     // Resume discovery: locate `.part` + journal, validate format and
     // geometry, and compute the ranges that can safely seed the plan.
-    let discovered = coordinator.as_ref().map(|c| discover_resume(c, &spec));
-    let (journal, resume) = match discovered {
-        Some(Ok(Some(j))) => {
-            let evidence = ResumeEvidence {
-                durable: j.payload().durable.clone(),
-                total: j.payload().total,
-                etag: j.payload().fingerprint.etag.clone(),
-                last_modified: j.payload().fingerprint.last_modified_unix.and_then(|unix| {
-                    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(unix))
-                }),
-                urls: vec![j.payload().fingerprint.final_url.clone()],
+    let (destination, resume) = match coordinator {
+        Some(coordinator) => {
+            let journal = discover_resume(&coordinator, &spec);
+            let resume = if !journal.payload().durable.is_empty() {
+                Some(Box::new(ResumeEvidence::Ranges {
+                    durable: journal.payload().durable.clone(),
+                    total: journal.payload().total,
+                    etag: journal.payload().fingerprint.etag.clone(),
+                    last_modified: journal.payload().fingerprint.last_modified_unix.and_then(
+                        |unix| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(unix)),
+                    ),
+                    urls: vec![journal.payload().fingerprint.final_url.clone()],
+                }))
+            } else if !matches!(journal.path().try_exists(), Ok(false)) {
+                Some(Box::new(ResumeEvidence::ResetRequired))
+            } else {
+                None
             };
-            (Some(j), Some(Box::new(evidence)))
+            (
+                DestinationState::File(Box::new(FileState {
+                    coordinator,
+                    journal,
+                })),
+                resume,
+            )
         }
-        _ => (None, None),
+        None => (
+            DestinationState::Custom(
+                cmd.shared_destination
+                    .clone()
+                    .expect("validated destination"),
+            ),
+            None,
+        ),
     };
 
     lp.jobs.insert(
@@ -614,15 +692,9 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
             result_tx: cmd.result_tx.clone(),
             admission: None,
             context: JobContext::with_durability(spec.deadline, spec.persistence),
-            destination: coordinator.map(DestinationState::File).unwrap_or_else(|| {
-                DestinationState::Custom(
-                    cmd.shared_destination
-                        .clone()
-                        .expect("validated destination"),
-                )
-            }),
+            destination,
             part_path,
-            journal,
+            checkpoints: Default::default(),
             refresher: cmd.refresher,
             progress: cmd.progress,
             provenance: std::sync::Arc::new(std::sync::Mutex::new(
@@ -654,7 +726,10 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
         lp.timers
             .schedule(deadline, crate::core::timers::TimerEvent::JobDeadline(job));
     }
-    let resumed = resume.as_ref().map_or(0, |r| r.durable.covered_len());
+    let resumed = resume.as_deref().map_or(0, |evidence| match evidence {
+        ResumeEvidence::Ranges { durable, .. } => durable.covered_len(),
+        ResumeEvidence::ResetRequired => 0,
+    });
     let _ = cmd.admit_tx.send(Ok(job));
     emit(
         lp,
@@ -688,13 +763,12 @@ fn admit_command(lp: &mut Loop, cmd: ControlCommand) {
 
 /// Load and validate a previous run's journal for this destination.
 ///
-/// Returns `Ok(None)` when there is nothing to resume. A corrupt or
-/// incompatible journal is discarded, not fatal. Durable ranges that do not
+/// A corrupt or incompatible journal starts empty. Durable ranges that do not
 /// fit inside an existing `.part` are dropped conservatively.
 fn discover_resume(
     coordinator: &FileDestinationCoordinator,
     spec: &crate::core::JobSpec,
-) -> Result<Option<Journal>> {
+) -> Journal {
     let journal_path = coordinator.journal_path();
     let part_path = coordinator.part_path();
     let fresh = |spec: &crate::core::JobSpec, path: std::path::PathBuf| -> Journal {
@@ -717,28 +791,24 @@ fn discover_resume(
 
     let mut journal = match Journal::load_blocking(&journal_path) {
         Ok(Some(j)) => j,
-        Ok(None) => return Ok(Some(fresh(spec, journal_path.clone()))),
+        Ok(None) => return fresh(spec, journal_path.clone()),
         // Corrupt/torn/incompatible version: resume from nothing.
-        Err(_) => return Ok(Some(fresh(spec, journal_path))),
+        Err(_) => return fresh(spec, journal_path),
     };
 
     // The partial artifact must exist and cover every durable range.
     if !part_path.exists() {
-        return Ok(Some(fresh(spec, journal_path.clone())));
+        return fresh(spec, journal_path.clone());
     }
     let part_len = std::fs::metadata(part_path).map(|m| m.len()).unwrap_or(0);
     if part_len == 0 {
-        return Ok(Some(fresh(spec, journal_path)));
+        return fresh(spec, journal_path);
     }
     let payload = journal.payload_mut();
-    let surviving: Vec<crate::core::ranges::ByteRange> = payload
-        .durable
-        .iter()
-        .filter(|r| r.end <= part_len)
-        .collect();
-    payload.durable.clear();
-    for r in surviving {
-        payload.durable.insert(r);
+    if payload.durable.iter().any(|range| range.end > part_len)
+        || payload.fingerprint.header_identity != spec.sources[0].representation_fingerprint()
+    {
+        payload.durable.clear();
     }
     // durable ⊆ completed by construction; after trimming, completed keeps
     // exactly the ranges that remain both written and durable.
@@ -753,12 +823,14 @@ fn discover_resume(
             payload.source_urls.push(src.url.to_string());
         }
     }
-    journal.mark_dirty();
-    Ok(Some(journal))
+    journal
 }
 
 fn route_actions(lp: &mut Loop, actions: &[Action]) {
     for action in actions {
+        if checkpoint::defer(lp, action) {
+            continue;
+        }
         tracing::trace!(target: "xde::engine", ?action, "control action");
         match action {
             Action::Resolve { origin, host, port } => {
@@ -1062,9 +1134,9 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                         Err(TrySendError::Full(_))
                     )
                 {
-                    lp.cleanup.push_back(Cleanup {
+                    lp.deferred_dispatch.push_back(DeferredDispatch {
                         shard,
-                        command: CleanupCommand::Close(*connection),
+                        command: DeferredCommand::Close(*connection),
                     });
                 }
             }
@@ -1079,7 +1151,10 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                 let durability = state.context.durability();
                 let destination =
                     std::mem::replace(&mut state.destination, DestinationState::Committing);
-                let coordinator = match destination {
+                let FileState {
+                    coordinator,
+                    journal,
+                } = match destination {
                     DestinationState::Custom(dest) => {
                         send_shard(
                             lp,
@@ -1093,7 +1168,7 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                         );
                         continue;
                     }
-                    DestinationState::File(coordinator) => coordinator,
+                    DestinationState::File(file) => *file,
                     DestinationState::Committing => {
                         lp.pending.push_back(Observation::DestinationFailed {
                             job: *job,
@@ -1116,6 +1191,7 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                         final_length: *final_length,
                         integrity: *integrity,
                         durability,
+                        journal,
                         lanes_closed,
                     },
                 );
@@ -1135,14 +1211,9 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                         crate::core::ArtifactProvenance::new();
                 }
             }
+            Action::DrainDestination { job } => checkpoint::drain(lp, *job),
             Action::FailJob { job, error } => {
-                let err = match error {
-                    crate::core::world::JobFailure::Cancelled => Error::Cancelled,
-                    crate::core::world::JobFailure::DeadlineExceeded => Error::DeadlineExceeded,
-                    crate::core::world::JobFailure::Failed(message) => {
-                        Error::destination(message.clone())
-                    }
-                };
+                let err = checkpoint::failure_error(error);
                 finish_job(lp, *job, Err(err));
             }
             Action::CompleteJob {
@@ -1159,23 +1230,7 @@ fn route_actions(lp: &mut Loop, actions: &[Action]) {
                     resumed_bytes: *resumed_bytes,
                 }),
             ),
-            Action::ResetResumeData { job } => {
-                if let Some(state) = lp.jobs.get_mut(job)
-                    && let Some(journal) = state.journal.as_mut()
-                {
-                    journal.clear_ranges();
-                    // Persist immediately: this is a correctness write, not
-                    // a throughput optimization.
-                    if let Err(error) = journal.persist_blocking() {
-                        tracing::error!(
-                            target: "xde::engine",
-                            ?job,
-                            %error,
-                            "resume wipe failed"
-                        );
-                    }
-                }
-            }
+            Action::ResetResumeData { job } => checkpoint::reset(lp, *job),
             Action::RequestCredentialRefresh {
                 job,
                 url,
@@ -1244,6 +1299,7 @@ fn send_shard(lp: &mut Loop, shard: usize, cmd: ShardCommand) {
         DestinationFailure, DestinationFailureKind, DispatchOperation as Op,
     };
     let (operation, job, assignment, connection) = match &cmd {
+        ShardCommand::Checkpoint { .. } => unreachable!("checkpoint admission owns its completion"),
         ShardCommand::OpenConnection { connection, .. } => {
             (Op::OpenConnection, None, None, Some(*connection))
         }
@@ -1558,7 +1614,7 @@ fn record_progress(lp: &mut Loop, obs: &Observation) {
             let Some(state) = lp.jobs.get_mut(job) else {
                 return;
             };
-            let Some(journal) = state.journal.as_mut() else {
+            let Some(journal) = state.destination.journal_mut() else {
                 return;
             };
             {
@@ -1589,85 +1645,10 @@ fn record_progress(lp: &mut Loop, obs: &Observation) {
             {
                 return;
             }
-            let durability = match lp.controller.world.jobs.get(*job) {
-                Some(j) => j.durability,
-                None => return,
-            };
-            match durability {
-                crate::core::spec::Durability::CrashSafe => {
-                    // Every verified piece must survive a crash before the
-                    // next one starts: fsync here is the contract.
-                    checkpoint_journal_at(lp, *job, |journal| {
-                        journal.record_completed(*range);
-                        journal.mark_completed_durable();
-                    });
-                }
-                crate::core::spec::Durability::Periodic(interval) => {
-                    // Record in memory; persist on the periodic timer. The
-                    // control thread must NEVER fsync per piece - that would
-                    // serialize the whole engine on disk latency.
-                    record_only(lp, *job, *range);
-                    schedule_checkpoint(lp, *job, interval);
-                }
-                crate::core::spec::Durability::Relaxed => {
-                    record_only(lp, *job, *range);
-                }
-            }
+            checkpoint::record(lp, *job, *range);
         }
         _ => {}
     }
-}
-
-/// Record a verified range in the in-memory journal without persisting.
-fn record_only(lp: &mut Loop, job: JobId, range: crate::core::ranges::ByteRange) {
-    if let Some(state) = lp.jobs.get_mut(&job)
-        && let Some(journal) = state.journal.as_mut()
-    {
-        journal.record_completed(range);
-    }
-}
-
-/// Persist one job's journal with the current fingerprint evidence, then
-/// mark everything recorded so far durable.
-fn checkpoint_journal(lp: &mut Loop, job: JobId) -> bool {
-    checkpoint_journal_at(lp, job, |journal| journal.mark_completed_durable())
-}
-
-fn checkpoint_journal_at(lp: &mut Loop, job: JobId, mutate: impl FnOnce(&mut Journal)) -> bool {
-    let persisted = {
-        let Some(state) = lp.jobs.get_mut(&job) else {
-            return false;
-        };
-        let Some(journal) = state.journal.as_mut() else {
-            return false;
-        };
-        mutate(journal);
-        sync_fingerprint(lp.controller.world.jobs.get(job), journal);
-        journal.persist_blocking().is_ok()
-    };
-    if persisted {
-        emit(
-            lp,
-            crate::core::events::Event::Checkpointed {
-                job,
-                bytes_done: lp
-                    .jobs
-                    .get(&job)
-                    .and_then(|s| s.journal.as_ref())
-                    .map_or(0, |j| j.payload().bytes_written),
-                durable: true,
-            },
-        );
-        true
-    } else {
-        false
-    }
-}
-
-fn schedule_checkpoint(lp: &mut Loop, job: JobId, interval: std::time::Duration) {
-    let at = Instant::now() + interval;
-    lp.timers
-        .schedule(at, crate::core::timers::TimerEvent::CheckpointDue(job));
 }
 
 /// Copy the controller's view of the representation into the journal.
@@ -1787,18 +1768,6 @@ fn source_for_connection(
 /// Terminal bookkeeping: reply to the waiter and drop state.
 fn finish_job(lp: &mut Loop, job: JobId, outcome: Result<JobOutcome>) {
     let ok = outcome.is_ok();
-    if ok {
-        // Published successfully: the journal's job is done.
-        if let Some(state) = lp.jobs.get(&job)
-            && let Some(journal) = state.journal.as_ref()
-        {
-            let _ = std::fs::remove_file(journal.path());
-        }
-    } else {
-        // Failure/cancellation: persist verified progress so a later run can
-        // resume. Best effort - losing it only costs re-downloaded bytes.
-        checkpoint_journal(lp, job);
-    }
     if let Some(state) = lp.jobs.remove(&job) {
         for (shard, tx) in lp.shard_txs.iter().enumerate() {
             if matches!(
@@ -1808,9 +1777,9 @@ fn finish_job(lp: &mut Loop, job: JobId, outcome: Result<JobOutcome>) {
                 }),
                 Err(TrySendError::Full(_))
             ) {
-                lp.cleanup.push_back(Cleanup {
+                lp.deferred_dispatch.push_back(DeferredDispatch {
                     shard,
-                    command: CleanupCommand::Release {
+                    command: DeferredCommand::Release {
                         job,
                         part_path: state.part_path.clone(),
                     },

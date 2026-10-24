@@ -538,6 +538,18 @@ fn cancelled_last_writer_cannot_start_a_commit() {
         },
         now,
     );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::DrainDestination { job: owner } if *owner == job))
+    );
+    assert_eq!(c.world.destination_leases.get(&destination), Some(&job));
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, Action::FailJob { .. } | Action::CompleteJob { .. }))
+    );
+    let actions = c.handle(Observation::DestinationDrained { job }, now);
     assert!(actions.iter().any(|a| matches!(
         a,
         Action::FailJob {
@@ -607,6 +619,15 @@ fn full_body_restart_drains_writers_and_rejects_retired_plan_messages() {
             now,
         );
     }
+    assert_eq!(c.world.jobs[job].phase, JobPhase::Resetting);
+    assert_eq!(c.active_assignment_count, 0);
+    c.handle(
+        Observation::ResumeDataReset {
+            job,
+            result: Ok(()),
+        },
+        now,
+    );
     let j = &c.world.jobs[job];
     assert_eq!(j.phase, JobPhase::Transferring);
     assert_ne!(j.plan_id, old[0].0.plan);
@@ -1026,6 +1047,12 @@ fn cancellation_releases_the_destination_lease() {
     let _ = c.handle(Observation::JobCancelled { job }, now);
     assert!(
         c.world
+            .destination_leases
+            .contains_key(&c.world.jobs[job].destination)
+    );
+    c.handle(Observation::DestinationDrained { job }, now);
+    assert!(
+        c.world
             .admit_job(
                 &spec("https://example.test/a.bin"),
                 crate::core::world::DestinationKey::File("k".into())
@@ -1047,6 +1074,7 @@ fn terminal_jobs_release_source_metadata() {
         );
         assert_eq!(c.world.sources.len(), 1);
         c.handle(Observation::JobCancelled { job }, now);
+        c.handle(Observation::DestinationDrained { job }, now);
         assert!(c.world.jobs.is_empty());
         assert!(c.world.destination_leases.is_empty());
         assert!(
@@ -1121,11 +1149,17 @@ fn retired_control_results_cannot_mutate_a_new_job_or_lease() {
         },
         now,
     );
+    c.handle(Observation::DestinationDrained { job }, now);
     let replacement = admit(&mut c, spec("https://example.test/b"), "out", now);
     let fresh_source = c.world.jobs[replacement].sources[0];
     assert_ne!(job, replacement);
     assert_ne!(source, fresh_source);
     for observation in [
+        Observation::DestinationDrained { job },
+        Observation::ResumeDataReset {
+            job,
+            result: Ok(()),
+        },
         Observation::Probed {
             job,
             connection,
@@ -1171,6 +1205,12 @@ fn deadline_fails_only_the_named_job() {
         },
         now,
     );
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::DrainDestination { job } if *job == j1))
+    );
+    let actions = c.handle(Observation::DestinationDrained { job: j1 }, now);
     assert!(
         actions
             .iter()
@@ -2012,4 +2052,102 @@ fn growing_a_solo_claim_uses_grants_and_acknowledged_range_yield() {
         now + Duration::from_millis(3102),
     );
     assert_eq!(c.world.jobs[job].plan.as_ref().unwrap().in_flight(), 2);
+}
+
+#[test]
+fn credential_callbacks_cannot_restart_a_destination_drain() {
+    let mut c = Controller::new();
+    let now = Instant::now();
+    let job = admit(&mut c, spec("https://example.test/a"), "out", now);
+    let (_, connection) = drive_to_transfer(&mut c, job, now, crate::Protocol::Http2, 1024);
+    let source = c.world.jobs[job].primary_source();
+    let original = c.world.sources[source].url.clone();
+    let (assignment, range) = active_assignment(&c, job);
+    c.handle(Observation::JobCancelled { job }, now);
+    c.handle(
+        Observation::AssignmentVerified {
+            job,
+            assignment,
+            range,
+            sample: sample(range.len(), 10, 0),
+            connection,
+            connection_reusable: true,
+        },
+        now,
+    );
+    assert!(matches!(
+        c.world.jobs[job].phase,
+        JobPhase::StoppingDestination(JobFailure::Cancelled)
+    ));
+    let actions = c.handle(
+        Observation::SourceRefreshed {
+            job,
+            url: Some("https://example.test/late".into()),
+            headers: Some(http::HeaderMap::new()),
+        },
+        now,
+    );
+    assert!(actions.is_empty());
+    assert!(matches!(
+        c.world.jobs[job].phase,
+        JobPhase::StoppingDestination(JobFailure::Cancelled)
+    ));
+    assert_eq!(c.world.sources[source].url, original);
+    let actions = c.handle(
+        Observation::CredentialRefreshFailed { job, status: 401 },
+        now,
+    );
+    assert!(actions.is_empty());
+    let actions = c.handle(Observation::DestinationDrained { job }, now);
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        Action::FailJob {
+            error: JobFailure::Cancelled,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn invalid_resume_waits_for_reset_without_losing_range_capability() {
+    let mut c = Controller::new();
+    let now = Instant::now();
+    let mut request = spec("https://example.test/a");
+    request.policy.topology = crate::TopologyPolicy::Fixed(crate::Topology::new(1, 2));
+    let job = admit(&mut c, request, "out", now);
+    let mut durable = crate::core::ranges::RangeSet::new();
+    durable.insert(ByteRange::new(0, 1024));
+    c.world.jobs[job].resume = Some(ResumeEvidence::Ranges {
+        durable,
+        total: Some(8 << 20),
+        etag: Some("\"old\"".into()),
+        last_modified: None,
+        urls: vec!["https://example.test/a".into()],
+    });
+    let (actions, _) = drive_to_transfer(&mut c, job, now, crate::Protocol::Http2, 8 << 20);
+    assert_eq!(c.world.jobs[job].phase, JobPhase::Resetting);
+    assert_eq!(c.active_assignment_count, 0);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::ResetResumeData { .. }))
+    );
+    assert!(!actions.iter().any(|action| matches!(
+        action,
+        Action::StartAssignment { .. } | Action::StartFullBody { .. }
+    )));
+    let actions = c.handle(
+        Observation::ResumeDataReset {
+            job,
+            result: Ok(()),
+        },
+        now,
+    );
+    assert!(c.world.jobs[job].supports_ranges);
+    assert_eq!(c.active_assignment_count, 2);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, Action::StartFullBody { .. }))
+    );
 }
